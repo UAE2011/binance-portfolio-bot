@@ -1,0 +1,30 @@
+version: "3.8"
+
+services:
+  trading-bot:
+    build: .
+    container_name: binance-portfolio-bot
+    restart: unless-stopped
+    env_file:
+      - .env
+    volumes:
+      - bot-data:/app/data
+      - bot-logs:/app/logs
+    environment:
+      - TZ=UTC
+      - PYTHONUNBUFFERED=1
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"
+    deploy:
+      resources:
+        limits:
+          memory: 1G
+
+volumes:
+  bot-data:
+    driver: local
+  bot-logs:
+    driver: local

@@ -1,0 +1,42 @@
+{
+  "sectors": {
+    "Store of Value": {
+      "max_allocation": 0.30,
+      "assets": ["BTC"]
+    },
+    "Smart Contract Platforms": {
+      "max_allocation": 0.25,
+      "assets": ["ETH", "SOL", "ADA", "AVAX", "NEAR", "SUI", "DOT", "ATOM", "FTM", "ALGO"]
+    },
+    "Layer 2 Solutions": {
+      "max_allocation": 0.15,
+      "assets": ["MATIC", "ARB", "OP", "STRK", "IMX", "METIS", "MANTA"]
+    },
+    "DeFi": {
+      "max_allocation": 0.15,
+      "assets": ["UNI", "AAVE", "MKR", "LINK", "SNX", "CRV", "COMP", "SUSHI", "DYDX", "LDO", "PENDLE", "INJ"]
+    },
+    "Infrastructure and Oracles": {
+      "max_allocation": 0.10,
+      "assets": ["GRT", "FIL", "AR", "THETA", "PYTH", "BAND"]
+    },
+    "AI and Data": {
+      "max_allocation": 0.10,
+      "assets": ["FET", "RNDR", "TAO", "OCEAN", "AGIX", "WLD", "AKT"]
+    },
+    "Exchange Tokens": {
+      "max_allocation": 0.10,
+      "assets": ["BNB", "CRO", "OKB"]
+    },
+    "Gaming and Metaverse": {
+      "max_allocation": 0.05,
+      "assets": ["AXS", "SAND", "GALA", "ENJ", "BEAM", "PIXEL", "PORTAL"]
+    },
+    "Meme": {
+      "max_allocation": 0.03,
+      "assets": ["DOGE", "SHIB", "PEPE", "FLOKI", "BONK", "WIF"]
+    }
+  },
+  "stablecoins": ["USDT", "USDC", "BUSD", "DAI", "TUSD", "FDUSD", "USDP"],
+  "excluded_suffixes": ["UP", "DOWN", "BULL", "BEAR"]
+}
