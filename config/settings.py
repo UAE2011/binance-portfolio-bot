@@ -159,9 +159,36 @@ def load_sectors() -> dict:
         return json.load(f)
 
 
+
+
+class AlphaConfig:
+    """
+    Alpha Hunter — targets early-mover setups before 20%+ pumps.
+    Uses: TTM Squeeze, OBV accumulation, RVOL spikes, new listings.
+    Smaller positions, wider TP targets, tighter stops — in/out fast.
+    """
+    ENABLED: bool = os.getenv("ALPHA_ENABLED", "true").lower() == "true"
+    MIN_SCORE: int = int(os.getenv("ALPHA_MIN_SCORE", "65"))
+    MAX_POSITIONS: int = int(os.getenv("ALPHA_MAX_POSITIONS", "2"))
+    POSITION_SIZE_PCT: float = float(os.getenv("ALPHA_POSITION_SIZE_PCT", "0.05"))
+    STOP_LOSS_PCT: float = float(os.getenv("ALPHA_STOP_LOSS_PCT", "0.05"))
+    TAKE_PROFIT_1_PCT: float = float(os.getenv("ALPHA_TP1_PCT", "0.10"))
+    TAKE_PROFIT_2_PCT: float = float(os.getenv("ALPHA_TP2_PCT", "0.20"))
+    SQUEEZE_MIN_BARS: int = int(os.getenv("ALPHA_SQUEEZE_MIN_BARS", "3"))
+    RVOL_SPIKE_THRESHOLD: float = float(os.getenv("ALPHA_RVOL_SPIKE", "3.0"))
+    RVOL_STRONG_THRESHOLD: float = float(os.getenv("ALPHA_RVOL_STRONG", "5.0"))
+    OBV_DIVERGENCE_BARS: int = int(os.getenv("ALPHA_OBV_DIV_BARS", "5"))
+    BB_WIDTH_LOOKBACK: int = int(os.getenv("ALPHA_BB_WIDTH_LOOKBACK", "30"))
+    SCAN_INTERVAL_SECONDS: int = int(os.getenv("ALPHA_SCAN_INTERVAL", "120"))
+    CHECK_NEW_LISTINGS: bool = os.getenv("ALPHA_CHECK_LISTINGS", "true").lower() == "true"
+    MAX_HOLD_HOURS: int = int(os.getenv("ALPHA_MAX_HOLD_HOURS", "24"))
+    MIN_POSITION_USDT: float = float(os.getenv("ALPHA_MIN_POSITION_USDT", "11.0"))
+    ALERT_THRESHOLD: int = int(os.getenv("ALPHA_ALERT_THRESHOLD", "60"))
+
 class Settings:
     binance = BinanceConfig()
     telegram = TelegramConfig()
+    alpha = AlphaConfig()
     ai = AIConfig()
     risk = RiskConfig()
     strategy = StrategyConfig()
@@ -202,3 +229,56 @@ class Settings:
     def is_leveraged_token(cls, symbol: str) -> bool:
         excluded = cls.sectors().get("excluded_suffixes", [])
         return any(symbol.endswith(s) for s in excluded)
+
+
+class AlphaConfig:
+    """
+    Alpha Hunter — targets early-mover setups before 20%+ pumps.
+    Uses: TTM Squeeze, OBV accumulation, RVOL spikes, new listings.
+    Smaller positions, wider TP targets, tighter stops — in/out fast.
+    """
+    ENABLED: bool = os.getenv("ALPHA_ENABLED", "true").lower() == "true"
+
+    # Score threshold for entry (0-100 scale, separate from main confluence)
+    MIN_SCORE: int = int(os.getenv("ALPHA_MIN_SCORE", "65"))
+
+    # Max simultaneous alpha positions (kept small — these are speculative)
+    MAX_POSITIONS: int = int(os.getenv("ALPHA_MAX_POSITIONS", "2"))
+
+    # Position size — % of portfolio per alpha play (default 5%)
+    POSITION_SIZE_PCT: float = float(os.getenv("ALPHA_POSITION_SIZE_PCT", "0.05"))
+
+    # Tight stop (alpha plays exit fast if wrong)
+    STOP_LOSS_PCT: float = float(os.getenv("ALPHA_STOP_LOSS_PCT", "0.05"))
+
+    # Large TP — targeting the pump, not a grind
+    TAKE_PROFIT_1_PCT: float = float(os.getenv("ALPHA_TP1_PCT", "0.10"))   # 10% → take 50%
+    TAKE_PROFIT_2_PCT: float = float(os.getenv("ALPHA_TP2_PCT", "0.20"))   # 20% → trail rest
+
+    # TTM Squeeze: minimum bars squeeze must be "on" before firing counts
+    SQUEEZE_MIN_BARS: int = int(os.getenv("ALPHA_SQUEEZE_MIN_BARS", "3"))
+
+    # RVOL threshold — volume must be N× average to count as spike
+    RVOL_SPIKE_THRESHOLD: float = float(os.getenv("ALPHA_RVOL_SPIKE", "3.0"))
+    RVOL_STRONG_THRESHOLD: float = float(os.getenv("ALPHA_RVOL_STRONG", "5.0"))
+
+    # OBV accumulation: how many bars of rising OBV vs flat price
+    OBV_DIVERGENCE_BARS: int = int(os.getenv("ALPHA_OBV_DIV_BARS", "5"))
+
+    # BB Width compression: current width vs N-bar rolling min
+    BB_WIDTH_LOOKBACK: int = int(os.getenv("ALPHA_BB_WIDTH_LOOKBACK", "30"))
+
+    # Scan interval (more frequent than main scan — alpha moves fast)
+    SCAN_INTERVAL_SECONDS: int = int(os.getenv("ALPHA_SCAN_INTERVAL", "120"))
+
+    # Binance announcement monitoring
+    CHECK_NEW_LISTINGS: bool = os.getenv("ALPHA_CHECK_LISTINGS", "true").lower() == "true"
+
+    # Max time to hold an alpha position (hours) — exit if stuck
+    MAX_HOLD_HOURS: int = int(os.getenv("ALPHA_MAX_HOLD_HOURS", "24"))
+
+    # Minimum absolute position size regardless of % (Binance min notional)
+    MIN_POSITION_USDT: float = float(os.getenv("ALPHA_MIN_POSITION_USDT", "11.0"))
+
+    # Telegram alert threshold
+    ALERT_THRESHOLD: int = int(os.getenv("ALPHA_ALERT_THRESHOLD", "60"))

@@ -352,7 +352,8 @@ class TelegramNotifier:
 # ------------------------------------------------------------------
 
 def build_command_handlers(portfolio, risk_manager, calibrator,
-                            watchdog, regime, news, ai) -> dict:
+                            watchdog, regime, news, ai,
+                            alpha_hunter=None) -> dict:
 
     async def cmd_status(args):
         s = portfolio.get_status()
@@ -780,8 +781,34 @@ def build_command_handlers(portfolio, risk_manager, calibrator,
             "/calibrate — Recalibrate parameters\n"
             "/health — System health\n"
             "/weekly — Weekly report\n"
-            "/report — Quick report"
+            "/report — Quick report\n\n"
+            "<b>Alpha Hunter</b>\n"
+            "/alpha — Early-mover opportunities (squeeze, OBV, RVOL)\n"
+            "/squeeze — Active TTM squeeze setups"
         )
+
+    async def cmd_alpha(args):
+        """Alpha hunter opportunities."""
+        if alpha_hunter:
+            return alpha_hunter.get_status_text()
+        return "Alpha Hunter not initialized."
+
+    async def cmd_squeeze(args):
+        """Show current TTM squeeze candidates."""
+        if not alpha_hunter:
+            return "Alpha Hunter not initialized."
+        opps = alpha_hunter.get_opportunities()
+        squeeze_opps = [o for o in opps
+                        if o.signals.get("squeeze_on") or o.signals.get("squeeze_fired")]
+        if not squeeze_opps:
+            return "No active squeeze setups found."
+        lines = []
+        for op in squeeze_opps[:8]:
+            bars = op.signals.get("squeeze_bars", 0)
+            fired = op.signals.get("squeeze_fired", False)
+            status = "🚨 FIRED" if fired else f"🔴 ON ({bars} bars)"
+            lines.append(f"  <code>{op.symbol}</code>: {status} | score={op.score}")
+        return "<b>🗜️ SQUEEZE SETUPS</b>\n\n" + "\n".join(lines)
 
     return {
         "/status": cmd_status,
@@ -809,4 +836,6 @@ def build_command_handlers(portfolio, risk_manager, calibrator,
         "/report": cmd_report,
         "/weekly": cmd_weekly,
         "/help": cmd_help,
+        "/alpha": cmd_alpha,
+        "/squeeze": cmd_squeeze,
     }

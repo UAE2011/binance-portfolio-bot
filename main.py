@@ -34,6 +34,7 @@ from src.scanner import AssetScanner
 from src.calibrator import Calibrator
 from src.watchdog import Watchdog
 from src.ai_advisor import AIAdvisor
+from src.alpha_hunter import AlphaHunter
 from src.utils import setup_logging, utc_now
 
 logger = setup_logging()
@@ -49,6 +50,7 @@ class BotState:
         self.last_rebalance_check = None
         self.last_dca_attempt = None
         self.last_auto_adjust = None
+        self.last_alpha_scan = None
         self.prev_regime: str = ""
         self.prev_mode: str = ""
         self.indicator_sets: dict = {}
@@ -450,6 +452,9 @@ async def main():
     risk.set_news_intel(news)
     portfolio = PortfolioManager(exchange, db, regime, risk, news)
     ai = AIAdvisor()
+    alpha_hunter = AlphaHunter(
+        exchange, portfolio, risk, news, notifier, db
+    )
     sr_engine = SupportResistanceEngine()
     scorer = ConfluenceScorer(regime, news, db, sr_engine)
     signal_gen = SignalGenerator(scorer, regime, news, ai)
@@ -462,7 +467,8 @@ async def main():
 
     # Wire Telegram commands
     handlers = build_command_handlers(
-        portfolio, risk, calibrator, watchdog, regime, news, ai
+        portfolio, risk, calibrator, watchdog, regime, news, ai,
+        alpha_hunter=alpha_hunter
     )
     notifier.register_commands(handlers)
 
@@ -525,6 +531,11 @@ async def main():
 
     logger.info("[6/6] Seeding indicators...")
     await initialize_indicators(bot_state, scanner, exchange)
+
+    # Seed alpha hunter indicators (runs in parallel with main scan)
+    asyncio.create_task(alpha_hunter.seed(
+        await scanner.get_watchlist()
+    ))
 
     bot_state.last_regime_check = utc_now()
     bot_state.last_news_update = utc_now()
@@ -613,6 +624,20 @@ async def main():
                     if result:
                         entries_this_cycle += 1
                         await notifier.notify_entry({**result, **signal})
+
+            # ── Alpha Hunter scan (every 2 min, faster than main) ──────
+            alpha_interval = timedelta(seconds=Settings.alpha.SCAN_INTERVAL_SECONDS)
+            if (bot_state.last_alpha_scan is None
+                    or (utc_now() - bot_state.last_alpha_scan) >= alpha_interval):
+                if not risk.kill_switch_active and not risk.is_paused:
+                    try:
+                        watchlist = await scanner.get_watchlist()
+                        alpha_opps = await alpha_hunter.scan(watchlist)
+                        await alpha_hunter.execute_alpha_entries(alpha_opps)
+                        await alpha_hunter.check_alpha_exits()
+                    except Exception as e:
+                        logger.debug("Alpha scan error: %s", e)
+                bot_state.last_alpha_scan = utc_now()
 
             # Sleep
             elapsed = (utc_now() - cycle_start).total_seconds()
