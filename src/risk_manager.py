@@ -339,11 +339,18 @@ class RiskManager:
         Avoids false triggers from stale all-time-high DB records (e.g. old
         testnet sessions with inflated fake balances).
         """
-        # Use the passed-in peak if available; fall back to DB only as last resort
+        # Use the passed-in peak (portfolio.peak_value — current session max).
+        # Fall back to DB only if no peak given, and sanity-check that the
+        # DB peak is not an inflated relic from an old session (>50% above current).
         if peak_value and peak_value > current_value:
             peak = peak_value
         else:
-            peak = self.db.get_peak_portfolio_value()
+            db_peak = self.db.get_peak_portfolio_value()
+            # Ignore DB peak if it is >50% above current — that is old data.
+            if db_peak > 0 and db_peak <= current_value * 1.5:
+                peak = db_peak
+            else:
+                peak = current_value  # treat current as peak — no drawdown
         if peak <= 0 or peak < 10.0:
             return {"drawdown_pct": 0, "action": "NONE"}
         if (peak - current_value) < 5.0:

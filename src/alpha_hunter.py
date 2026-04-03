@@ -160,13 +160,27 @@ class AlphaHunter:
 
     # ─── Main Scan ────────────────────────────────────────────────────────
 
-    async def scan(self, watchlist: list) -> list:
+    async def scan(self, watchlist: list = None) -> list:
         """
         Full alpha scan across watchlist.
         Returns list of AlphaSetup sorted by score desc.
         """
         self._cycle += 1
         opportunities = []
+
+        # Self-fetch watchlist if not provided (fully autonomous)
+        if watchlist is None:
+            try:
+                tickers = await self.exchange.get_24h_tickers()
+                watchlist = [
+                    {"symbol": t["symbol"]}
+                    for t in tickers
+                    if t.get("symbol", "").endswith("USDT")
+                    and float(t.get("quoteVolume", 0)) >= 5_000_000
+                ][:80]
+            except Exception:
+                watchlist = list(self._states.keys())[:80]
+                watchlist = [{"symbol": s} for s in watchlist]
 
         # Update indicators and score each symbol
         for asset in watchlist:

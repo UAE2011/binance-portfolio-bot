@@ -315,6 +315,11 @@ async def scan_for_signals(scanner: AssetScanner, bot_state: BotState,
 
 async def enforce_circuit_breakers(portfolio: PortfolioManager, risk: RiskManager,
                                    notifier: TelegramNotifier):
+    # If kill switch already active, skip re-evaluation (avoids spamming Telegram
+    # and re-liquidating positions that are already closed).
+    if risk.kill_switch_active:
+        return
+
     dd = risk.check_drawdown(portfolio.portfolio_value, portfolio.peak_value)
     action = dd.get("action", "NONE")
 
@@ -348,10 +353,8 @@ async def enforce_circuit_breakers(portfolio: PortfolioManager, risk: RiskManage
         for r in results:
             await notifier.notify_exit(r)
         risk.kill_switch_active = True
-        await notifier.send_alert(
-            f"🚨 KILL SWITCH\nDrawdown: {dd['drawdown_pct']:.1%}\n"
-            "All positions closed. /resume to restart."
-        )
+        # notify_circuit_breaker() above already sent the kill switch message.
+        # No duplicate send_alert needed.
 
 
 # ─── Scheduled Tasks ─────────────────────────────────────────────────────────
@@ -493,7 +496,10 @@ async def main():
     # Previous sessions (especially testnet) leave inflated peaks in the DB that
     # cause false 30-40% drawdown readings on a perfectly healthy live portfolio.
     db.reset_peak_to_current(portfolio.portfolio_value)
-    logger.info("Peak reset to current portfolio value: $%.2f", portfolio.portfolio_value)
+    # Also reset the in-memory peak so sync_with_exchange() max() comparison
+    # never picks up the old inflated peak value from any prior session.
+    portfolio.peak_value = portfolio.portfolio_value
+    logger.info("Peak reset to $%.2f (cleared stale DB history)", portfolio.portfolio_value)
 
     logger.info("[4/6] Scanning spot wallet for existing positions...")
     imported = await portfolio.import_spot_positions()

@@ -225,8 +225,15 @@ class PortfolioManager:
 
         self.invested_value = invested
         self.portfolio_value = self.cash_available + invested
-        self.peak_value = max(self.peak_value, self.portfolio_value,
-                              self.db.get_peak_portfolio_value())
+        # Use the DB peak only if it is within 50% of current value.
+        # A DB peak >50% above current means old session data — ignore it
+        # so stale testnet or prior session peaks never trigger false circuit breakers.
+        db_peak = self.db.get_peak_portfolio_value()
+        if db_peak > 0 and db_peak < self.portfolio_value * 1.5:
+            self.peak_value = max(self.peak_value, self.portfolio_value, db_peak)
+        else:
+            # DB peak is unreasonably high (>50% above current) — use current only.
+            self.peak_value = max(self.peak_value, self.portfolio_value)
         drawdown = ((self.peak_value - self.portfolio_value) / self.peak_value
                     if self.peak_value > 0 else 0)
 
