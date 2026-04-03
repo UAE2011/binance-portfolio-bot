@@ -315,9 +315,16 @@ class PortfolioManager:
         self.sector_exposure = {}
         for pos in self.open_positions:
             try:
-                current_price = await self.exchange.get_price(pos["symbol"])
-                pos_value = (pos.get("remaining_quantity", pos["quantity"]) * current_price
-                             if current_price > 0 else pos.get("usdt_value", 0))
+                symbol = pos["symbol"]
+                asset = symbol.replace("USDT", "").replace("BUSD", "")
+                # Use wallet quantity if available — prevents ghost positions
+                # from inflating invested value with stale DB quantities
+                wallet_qty = balances.get(asset, {}).get("total", 0) if balances else 0
+                db_qty = pos.get("remaining_quantity", pos["quantity"])
+                # Take the smaller of wallet vs DB qty (reality wins)
+                actual_qty = min(wallet_qty, db_qty) if wallet_qty > 0 else db_qty
+                current_price = await self.exchange.get_price(symbol)
+                pos_value = actual_qty * current_price if current_price > 0 else 0
                 invested += pos_value
                 sector = pos.get("sector", "Other")
                 self.sector_exposure[sector] = self.sector_exposure.get(sector, 0) + pos_value

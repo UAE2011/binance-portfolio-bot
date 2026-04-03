@@ -331,7 +331,8 @@ class RiskManager:
     # Circuit Breakers — Escalating drawdown response
     # ------------------------------------------------------------------
 
-    def check_drawdown(self, current_value: float, peak_value: float = None) -> dict:
+    def check_drawdown(self, current_value: float, peak_value: float = None,
+                       startup_grace: bool = False) -> dict:
         """
         3-stage circuit breaker system:
         5% drawdown  → reduce position sizes 50%
@@ -343,6 +344,11 @@ class RiskManager:
         Avoids false triggers from stale all-time-high DB records (e.g. old
         testnet sessions with inflated fake balances).
         """
+        # Startup grace period: skip circuit breaker for first 3 min
+        # Allows ghost cleanup + resync to complete without false kill switch
+        if startup_grace:
+            return {"drawdown_pct": 0, "action": "NONE"}
+
         # Use the passed-in peak (portfolio.peak_value — current session max).
         # Fall back to DB only if no peak given, and sanity-check that the
         # DB peak is not an inflated relic from an old session (>50% above current).

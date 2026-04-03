@@ -51,6 +51,7 @@ class BotState:
         self.last_dca_attempt = None
         self.last_auto_adjust = None
         self.last_alpha_scan = None
+        self.startup_time = None
         self.prev_regime: str = ""
         self.prev_mode: str = ""
         self.indicator_sets: dict = {}
@@ -314,13 +315,20 @@ async def scan_for_signals(scanner: AssetScanner, bot_state: BotState,
 # ─── Circuit Breaker Enforcement ─────────────────────────────────────────────
 
 async def enforce_circuit_breakers(portfolio: PortfolioManager, risk: RiskManager,
-                                   notifier: TelegramNotifier):
-    # If kill switch already active, skip re-evaluation (avoids spamming Telegram
-    # and re-liquidating positions that are already closed).
+                                   notifier: TelegramNotifier,
+                                   startup_time=None):
+    # If kill switch already active, skip re-evaluation
     if risk.kill_switch_active:
         return
 
-    dd = risk.check_drawdown(portfolio.portfolio_value, portfolio.peak_value)
+    # Grace period: ignore drawdown for first 3 min after startup
+    # Gives ghost cleanup + resync time to settle before evaluating
+    from src.utils import utc_now
+    from datetime import timedelta
+    in_grace = (startup_time is not None and
+                (utc_now() - startup_time).total_seconds() < 180)
+    dd = risk.check_drawdown(portfolio.portfolio_value, portfolio.peak_value,
+                             startup_grace=in_grace)
     action = dd.get("action", "NONE")
 
     if action in ("NONE", "WARNING"):
@@ -646,6 +654,7 @@ async def main():
     )
     await notifier.send_message(startup_msg)
 
+    bot_state.startup_time = utc_now()
     logger.info("✅ Initialized. Mode=%s Regime=%s Rotation=%s Portfolio=$%.2f",
                 regime.current_mode, regime.current_regime,
                 rotation, portfolio.portfolio_value)
@@ -663,7 +672,7 @@ async def main():
             await portfolio.sync_with_exchange()
 
             # Circuit breakers
-            await enforce_circuit_breakers(portfolio, risk, notifier)
+            await enforce_circuit_breakers(portfolio, risk, notifier, bot_state.startup_time)
 
             # Auto-resume check — lifts kill switch when drawdown recovers
             await check_auto_resume(portfolio, risk, notifier)
