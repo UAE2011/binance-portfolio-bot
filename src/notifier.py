@@ -452,7 +452,7 @@ def build_command_handlers(portfolio, risk_manager, calibrator,
 
     async def cmd_circuit(args):
         """Circuit breaker status."""
-        dd = risk_manager.check_drawdown(portfolio.portfolio_value)
+        dd = risk_manager.check_drawdown(portfolio.portfolio_value, portfolio.peak_value)
         drawdown = dd.get("drawdown_pct", 0)
         action = dd.get("action", "NONE")
 
@@ -669,7 +669,7 @@ def build_command_handlers(portfolio, risk_manager, calibrator,
 
     async def cmd_risk(args):
         rs = risk_manager.get_status_summary()
-        dd = risk_manager.check_drawdown(portfolio.portfolio_value)
+        dd = risk_manager.check_drawdown(portfolio.portfolio_value, portfolio.peak_value)
         return (
             f"<b>⚠️ RISK STATUS</b>\n\n"
             f"Kill Switch: <code>{'🚨 ACTIVE' if rs['kill_switch_active'] else '✅ Off'}</code>\n"

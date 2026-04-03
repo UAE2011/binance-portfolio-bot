@@ -256,6 +256,24 @@ class Database:
             ).fetchone()
             return row["peak"] if row and row["peak"] else 0.0
 
+    def reset_peak_to_current(self, current_value: float):
+        """
+        Delete all historical snapshots so get_peak_portfolio_value() returns
+        approximately the current portfolio value. Called on startup to avoid
+        false circuit-breaker triggers from stale historical peaks (e.g. old
+        testnet sessions with inflated balances).
+        """
+        with self._conn() as conn:
+            conn.execute("DELETE FROM portfolio_snapshots")
+            # Insert a fresh baseline snapshot at current value
+            conn.execute(
+                """INSERT INTO portfolio_snapshots
+                   (timestamp, total_value_usdt, cash_usdt, invested_usdt,
+                    num_open_positions, drawdown_from_peak)
+                   VALUES (?, ?, ?, ?, 0, 0.0)""",
+                (utc_now(), current_value, current_value, 0)
+            )
+
     # ------------------------------------------------------------------
     # Signals
     # ------------------------------------------------------------------

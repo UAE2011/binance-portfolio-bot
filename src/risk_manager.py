@@ -327,15 +327,23 @@ class RiskManager:
     # Circuit Breakers — Escalating drawdown response
     # ------------------------------------------------------------------
 
-    def check_drawdown(self, current_value: float) -> dict:
+    def check_drawdown(self, current_value: float, peak_value: float = None) -> dict:
         """
         3-stage circuit breaker system:
         5% drawdown  → reduce position sizes 50%
         10% drawdown → close 50% of positions
         15% drawdown → go to cash (capital preservation)
         20% drawdown → kill switch (full stop)
+
+        peak_value: pass portfolio.peak_value (current-session tracked peak).
+        Avoids false triggers from stale all-time-high DB records (e.g. old
+        testnet sessions with inflated fake balances).
         """
-        peak = self.db.get_peak_portfolio_value()
+        # Use the passed-in peak if available; fall back to DB only as last resort
+        if peak_value and peak_value > current_value:
+            peak = peak_value
+        else:
+            peak = self.db.get_peak_portfolio_value()
         if peak <= 0 or peak < 10.0:
             return {"drawdown_pct": 0, "action": "NONE"}
         if (peak - current_value) < 5.0:

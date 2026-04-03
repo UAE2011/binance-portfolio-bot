@@ -313,7 +313,7 @@ async def scan_for_signals(scanner: AssetScanner, bot_state: BotState,
 
 async def enforce_circuit_breakers(portfolio: PortfolioManager, risk: RiskManager,
                                    notifier: TelegramNotifier):
-    dd = risk.check_drawdown(portfolio.portfolio_value)
+    dd = risk.check_drawdown(portfolio.portfolio_value, portfolio.peak_value)
     action = dd.get("action", "NONE")
 
     if action in ("NONE", "WARNING"):
@@ -483,6 +483,12 @@ async def main():
     logger.info("[3/6] Syncing portfolio from DB...")
     await portfolio.sync_with_exchange()
 
+    # Reset stale historical peak so circuit breakers use today's actual value.
+    # Previous sessions (especially testnet) leave inflated peaks in the DB that
+    # cause false 30-40% drawdown readings on a perfectly healthy live portfolio.
+    db.reset_peak_to_current(portfolio.portfolio_value)
+    logger.info("Peak reset to current portfolio value: $%.2f", portfolio.portfolio_value)
+
     logger.info("[4/6] Scanning spot wallet for existing positions...")
     imported = await portfolio.import_spot_positions()
 
@@ -504,13 +510,26 @@ async def main():
     logger.info("[5/6] Loading risk history...")
     risk.initialize_from_history()
 
+    # ── Start Telegram polling immediately so commands work during seeding ──
+    poll_task = asyncio.create_task(notifier.start_polling())
+
+    # Send a quick ping so user knows bot is alive before the slow seeding step
+    await notifier.send_message(
+        f"<b>🤖 Bot starting up...</b> {'🔴 LIVE' if not testnet else '🟡 TESTNET'}\n"
+        f"Portfolio: <code>${portfolio.portfolio_value:.2f}</code> | "
+        f"Positions: <code>{len(portfolio.open_positions)}</code>\n"
+        f"Regime: <code>{regime.current_regime}</code> | "
+        f"F&G: <code>{news.fear_greed_value} ({news.fear_greed_label})</code>\n"
+        f"<i>Seeding indicators for 50+ assets... full status follows.</i>"
+    )
+
     logger.info("[6/6] Seeding indicators...")
     await initialize_indicators(bot_state, scanner, exchange)
 
     bot_state.last_regime_check = utc_now()
     bot_state.last_news_update = utc_now()
 
-    # ── Startup Notification ────────────────────────────────────────────
+    # ── Full Startup Notification (after seeding) ───────────────────────
 
     mode_e = regime.get_mode_emoji()
     rotation = news.get_dominance_strategy()
@@ -535,9 +554,6 @@ async def main():
         f"Send /help for all commands.</i>"
     )
     await notifier.send_message(startup_msg)
-
-    # Start Telegram polling
-    poll_task = asyncio.create_task(notifier.start_polling())
 
     logger.info("✅ Initialized. Mode=%s Regime=%s Rotation=%s Portfolio=$%.2f",
                 regime.current_mode, regime.current_regime,
