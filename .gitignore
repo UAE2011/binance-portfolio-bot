@@ -35,3 +35,4 @@ Thumbs.db
 /tmp/
 *.tmp
 bot_heartbeat
+create_env.sh
