@@ -1,4 +1,5 @@
 import asyncio
+import json
 import os
 import time
 import psutil
@@ -9,7 +10,7 @@ from src.utils import setup_logging, utc_now
 
 logger = setup_logging()
 
-HEARTBEAT_FILE = Path("data/heartbeat.txt")
+HEARTBEAT_FILE = Path(os.getenv("HEARTBEAT_FILE", "data/heartbeat.txt"))
 HEARTBEAT_INTERVAL = 10
 MAX_HEARTBEAT_AGE = 60
 MEMORY_LIMIT_MB = 512
@@ -187,11 +188,11 @@ class Watchdog:
             callback = self.exchange._ws_callbacks.get(ws_name)
             if callback:
                 if ws_name == "kline":
-                    watchlist = self.db.load_state("watchlist_symbols")
-                    if watchlist:
-                        import json
-                        symbols = json.loads(watchlist)
-                        await self.exchange.start_kline_stream(symbols, "1h", callback)
+                    # Use same state key as main.py ("watchlist") and same timeframe ("15m")
+                    watchlist_json = self.db.load_state("watchlist")
+                    if watchlist_json:
+                        symbols = json.loads(watchlist_json)
+                        await self.exchange.start_kline_stream(symbols, "15m", callback)
                 elif ws_name == "ticker":
                     await self.exchange.start_ticker_stream(callback)
                 await asyncio.sleep(5)

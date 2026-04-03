@@ -66,12 +66,12 @@ class TradingBot:
 
         # Strategy
         self.sr_engine = SupportResistanceEngine()
-        self.scanner = AssetScanner(self.exchange, self.news)
+        self.scanner = AssetScanner(self.exchange, self.regime, self.news)
         self.scorer = ConfluenceScorer(self.regime, self.news, self.db, self.sr_engine)
         self.signal_gen = SignalGenerator(self.scorer, self.regime, self.news, self.ai)
 
         # Calibration
-        self.calibrator = SelfCalibrator(self.db, self.risk)
+        self.calibrator = SelfCalibrator(self.db, self.risk, self.regime)
 
         # Notifications
         self.notifier = TelegramNotifier(
@@ -102,11 +102,15 @@ class TradingBot:
                      Settings.TESTNET, Settings.ai.ENABLED, Settings.ai.MODEL)
         logger.info("=" * 60)
 
-        # Setup signal handlers
-        for sig in (signal.SIGTERM, signal.SIGINT):
-            asyncio.get_event_loop().add_signal_handler(
-                sig, lambda: asyncio.create_task(self._shutdown_handler()),
-            )
+        # Setup signal handlers (not supported on Windows outside Docker)
+        try:
+            loop = asyncio.get_event_loop()
+            for sig in (signal.SIGTERM, signal.SIGINT):
+                loop.add_signal_handler(
+                    sig, lambda: asyncio.create_task(self._shutdown_handler()),
+                )
+        except NotImplementedError:
+            logger.warning("Signal handlers not supported on this OS, using KeyboardInterrupt fallback")
 
         # Initialize all components
         self.db.init_db()

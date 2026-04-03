@@ -1,8 +1,9 @@
+import os
 import sys
 import time
 from pathlib import Path
 
-HEARTBEAT_FILE = Path("data/heartbeat.txt")
+HEARTBEAT_FILE = Path(os.getenv("HEARTBEAT_FILE", "data/heartbeat.txt"))
 MAX_AGE_SECONDS = 120
 
 

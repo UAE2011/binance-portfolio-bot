@@ -124,7 +124,7 @@ class OperationalConfig:
     DB_PATH: str = os.getenv("DB_PATH", "data/bot.db")
     TIMEZONE: str = os.getenv("TIMEZONE", "UTC")
     WATCHDOG_INTERVAL: int = int(os.getenv("WATCHDOG_INTERVAL_SECONDS", "10"))
-    HEARTBEAT_FILE: str = os.getenv("HEARTBEAT_FILE", "/tmp/bot_heartbeat")
+    HEARTBEAT_FILE: str = os.getenv("HEARTBEAT_FILE", "data/heartbeat.txt")
     STATE_FILE: str = os.getenv("STATE_FILE", "data/bot_state.json")
     # Weekly report
     WEEKLY_REPORT_DAY: int = int(os.getenv("WEEKLY_REPORT_DAY", "0"))  # 0=Monday

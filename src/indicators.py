@@ -339,22 +339,72 @@ class IndicatorSet:
 
 
 def compute_batch_indicators(df: pd.DataFrame) -> pd.DataFrame:
-    """Compute full indicators on a DataFrame of OHLCV data using pandas-ta."""
-    try:
-        import pandas_ta as ta
-        df.ta.sma(length=50, append=True)
-        df.ta.sma(length=200, append=True)
-        df.ta.ema(length=9, append=True)
-        df.ta.ema(length=21, append=True)
-        df.ta.rsi(length=14, append=True)
-        df.ta.macd(fast=12, slow=26, signal=9, append=True)
-        df.ta.bbands(length=20, std=2, append=True)
-        df.ta.atr(length=14, append=True)
-        df.ta.adx(length=14, append=True)
-        df.ta.obv(append=True)
-        df.ta.stochrsi(length=14, rsi_length=14, k=3, d=3, append=True)
-    except ImportError:
-        logger.warning("pandas-ta not available, using incremental indicators only")
+    """Compute full indicators on a DataFrame of OHLCV data using pure pandas/numpy."""
+    close = df["close"]
+    high = df["high"]
+    low = df["low"]
+    volume = df["volume"]
+
+    # SMA
+    df["SMA_50"] = close.rolling(window=50).mean()
+    df["SMA_200"] = close.rolling(window=200).mean()
+
+    # EMA
+    df["EMA_9"] = close.ewm(span=9, adjust=False).mean()
+    df["EMA_21"] = close.ewm(span=21, adjust=False).mean()
+
+    # RSI
+    delta = close.diff()
+    gain = delta.where(delta > 0, 0.0).ewm(alpha=1.0 / 14, adjust=False).mean()
+    loss = (-delta.where(delta < 0, 0.0)).ewm(alpha=1.0 / 14, adjust=False).mean()
+    rs = gain / loss.replace(0, np.nan)
+    df["RSI_14"] = 100.0 - (100.0 / (1.0 + rs))
+
+    # MACD
+    ema12 = close.ewm(span=12, adjust=False).mean()
+    ema26 = close.ewm(span=26, adjust=False).mean()
+    df["MACD_12_26_9"] = ema12 - ema26
+    df["MACDs_12_26_9"] = df["MACD_12_26_9"].ewm(span=9, adjust=False).mean()
+    df["MACDh_12_26_9"] = df["MACD_12_26_9"] - df["MACDs_12_26_9"]
+
+    # Bollinger Bands
+    sma20 = close.rolling(window=20).mean()
+    std20 = close.rolling(window=20).std()
+    df["BBU_20_2.0"] = sma20 + 2.0 * std20
+    df["BBM_20_2.0"] = sma20
+    df["BBL_20_2.0"] = sma20 - 2.0 * std20
+
+    # ATR
+    tr = pd.concat([
+        high - low,
+        (high - close.shift(1)).abs(),
+        (low - close.shift(1)).abs()
+    ], axis=1).max(axis=1)
+    df["ATRr_14"] = tr.ewm(alpha=1.0 / 14, adjust=False).mean()
+
+    # ADX
+    plus_dm = high.diff()
+    minus_dm = -low.diff()
+    plus_dm = plus_dm.where((plus_dm > minus_dm) & (plus_dm > 0), 0.0)
+    minus_dm = minus_dm.where((minus_dm > plus_dm) & (minus_dm > 0), 0.0)
+    atr14 = df["ATRr_14"]
+    plus_di = 100.0 * (plus_dm.ewm(alpha=1.0 / 14, adjust=False).mean() / atr14.replace(0, np.nan))
+    minus_di = 100.0 * (minus_dm.ewm(alpha=1.0 / 14, adjust=False).mean() / atr14.replace(0, np.nan))
+    dx = 100.0 * (plus_di - minus_di).abs() / (plus_di + minus_di).replace(0, np.nan)
+    df["ADX_14"] = dx.ewm(alpha=1.0 / 14, adjust=False).mean()
+
+    # OBV
+    obv = (np.sign(close.diff()) * volume).fillna(0).cumsum()
+    df["OBV"] = obv
+
+    # StochRSI
+    rsi = df["RSI_14"]
+    rsi_min = rsi.rolling(window=14).min()
+    rsi_max = rsi.rolling(window=14).max()
+    stochrsi = (rsi - rsi_min) / (rsi_max - rsi_min).replace(0, np.nan)
+    df["STOCHRSIk_14_14_3_3"] = stochrsi.rolling(window=3).mean() * 100
+    df["STOCHRSId_14_14_3_3"] = df["STOCHRSIk_14_14_3_3"].rolling(window=3).mean()
+
     return df
 
 
