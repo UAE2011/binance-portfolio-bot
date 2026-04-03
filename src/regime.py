@@ -243,29 +243,31 @@ class RegimeDetector:
         return days_since >= 7
 
     def get_regime_params(self) -> dict:
+        """Regime adjusts position sizing and risk, but NEVER blocks entries.
+        The bot always trades — regime only controls how aggressively."""
         params = {
             REGIME_BULL: {
                 "entries_allowed": True, "position_multiplier": 1.0,
                 "stop_atr_mult": 3.0, "tp_atr_mult": 4.5,
-                "max_exposure": 0.80, "confluence_threshold": 70,
+                "max_exposure": 0.80, "confluence_threshold": 40,
                 "news_interval_min": 15,
             },
             REGIME_SIDEWAYS: {
-                "entries_allowed": True, "position_multiplier": 0.5,
+                "entries_allowed": True, "position_multiplier": 0.7,
                 "stop_atr_mult": 2.0, "tp_atr_mult": 2.5,
-                "max_exposure": 0.50, "confluence_threshold": 85,
+                "max_exposure": 0.60, "confluence_threshold": 50,
                 "news_interval_min": 10,
             },
             REGIME_HIGH_VOL: {
-                "entries_allowed": False, "position_multiplier": 0.25,
+                "entries_allowed": True, "position_multiplier": 0.4,
                 "stop_atr_mult": 1.5, "tp_atr_mult": 2.0,
-                "max_exposure": 0.25, "confluence_threshold": 90,
+                "max_exposure": 0.40, "confluence_threshold": 55,
                 "news_interval_min": 5,
             },
             REGIME_BEAR: {
-                "entries_allowed": False, "position_multiplier": 0.0,
-                "stop_atr_mult": 1.0, "tp_atr_mult": 0.0,
-                "max_exposure": 0.0, "confluence_threshold": 100,
+                "entries_allowed": True, "position_multiplier": 0.25,
+                "stop_atr_mult": 1.0, "tp_atr_mult": 1.5,
+                "max_exposure": 0.25, "confluence_threshold": 60,
                 "news_interval_min": 5,
             },
         }

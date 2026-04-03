@@ -103,8 +103,8 @@ RESPONSE FORMAT — You MUST respond with valid JSON only, no markdown:
 
 class ModelTier:
     """Defines which model tier to use for each call type."""
-    FAST = "fast"      # gemini-2.5-flash — cheap, fast, good for extraction
-    STRONG = "strong"  # gpt-4.1-mini — better reasoning, structured output
+    FAST = "fast"      # llama-3.1-8b-instant — ultra-fast, good for extraction
+    STRONG = "strong"  # llama-3.3-70b-versatile — strong reasoning, trade decisions
 
 
 # ─── AI Advisor ──────────────────────────────────────────────────────────────
@@ -136,13 +136,10 @@ class AIAdvisor:
         return self.cfg.FAST_MODEL
 
     def _estimate_cost(self, tier: str, total_tokens: int) -> float:
-        """Estimate cost in USD for a call based on tier and tokens."""
-        if tier == ModelTier.FAST:
-            # Gemini 2.5 Flash: ~$0.30 input / $2.50 output per 1M tokens
-            return total_tokens * 1.5 / 1_000_000  # blended average
-        else:
-            # GPT-4.1-mini: ~$0.40 input / $1.60 output per 1M tokens
-            return total_tokens * 1.0 / 1_000_000  # blended average
+        """Estimate cost in USD for a call based on tier and tokens.
+        Groq free tier: both models are $0.00 — tracking for future paid providers."""
+        # Groq is free; return 0 for accurate tracking
+        return 0.0
 
     # ── Daily Limits ─────────────────────────────────────────────────────
 
@@ -159,7 +156,8 @@ class AIAdvisor:
         self._reset_daily_counter()
         if self.daily_call_count >= self.cfg.MAX_DAILY_CALLS:
             return False
-        if self.daily_cost_usd >= self.cfg.DAILY_COST_LIMIT_USD:
+        # Cost limit of 0.00 means unlimited (free providers like Groq)
+        if self.cfg.DAILY_COST_LIMIT_USD > 0 and self.daily_cost_usd >= self.cfg.DAILY_COST_LIMIT_USD:
             return False
         return True
 
@@ -525,7 +523,8 @@ Should I BUY {symbol} now? Analyze the setup quality, risk/reward, and timing.""
 
     def should_approve_entry(self, ai_result: Optional[dict],
                              confluence_score: int) -> dict:
-        """Combine AI verdict with confluence score for final decision."""
+        """Combine AI verdict with confluence score for final decision.
+        When VETO_POWER is off, AI is advisory only — trades proceed on confluence."""
         if ai_result is None:
             return {"approved": True, "reason": "AI unavailable, using confluence only"}
 
@@ -542,6 +541,7 @@ Should I BUY {symbol} now? Analyze the setup quality, risk/reward, and timing.""
                 "ai_size": ai_result.get("position_size_pct"),
             }
 
+        # If VETO_POWER is on, AI can block trades
         if verdict == "SKIP" and self.cfg.VETO_POWER:
             return {
                 "approved": False,
@@ -549,10 +549,11 @@ Should I BUY {symbol} now? Analyze the setup quality, risk/reward, and timing.""
                 "ai_confidence": confidence,
             }
 
-        if verdict == "SKIP" and not self.cfg.VETO_POWER and confluence_score >= 80:
+        # If VETO_POWER is off, AI is advisory only — always approve if confluence met
+        if not self.cfg.VETO_POWER:
             return {
                 "approved": True,
-                "reason": f"AI skeptical but confluence high ({confluence_score}), proceeding",
+                "reason": f"AI says {verdict} (confidence={confidence:.0%}) but veto off, proceeding on confluence ({confluence_score})",
                 "ai_confidence": confidence,
             }
 
