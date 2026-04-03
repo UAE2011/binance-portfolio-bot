@@ -420,18 +420,24 @@ class RiskManager:
             return {"allowed": False, "reason": "Capital preservation mode — no new entries"}
 
         open_count = len(open_positions)
-        # Dynamic position limit based on portfolio size:
-        # Small account = fewer positions so each is adequately sized
-        if portfolio_value < 200:
-            max_pos = 3
-        elif portfolio_value < 500:
-            max_pos = 5
-        elif portfolio_value < 2000:
-            max_pos = 6
-        else:
-            max_pos = self.cfg.MAX_OPEN_POSITIONS
-        if open_count >= max_pos:
-            return {"allowed": False, "reason": f"Max positions ({max_pos}) reached for ${portfolio_value:.0f} account"}
+        # Max positions = how many more the available cash can fund.
+        # Each new position needs at least the Binance notional minimum ($10)
+        # plus a sensible per-trade size (1% of portfolio, min $11).
+        min_viable_position = max(11.0, portfolio_value * 0.01)
+        # How many more can we open with remaining cash?
+        affordable = int(cash_available / min_viable_position)
+        # Hard cap: no more than configured max (prevents over-diversification)
+        max_pos = min(affordable + open_count, self.cfg.MAX_OPEN_POSITIONS)
+        if open_count >= max_pos or affordable <= 0:
+            return {
+                "allowed": False,
+                "reason": (
+                    f"Insufficient cash for new position "
+                    f"(have ${cash_available:.2f}, need ≥${min_viable_position:.2f})"
+                    if affordable <= 0
+                    else f"Max affordable positions ({max_pos}) reached"
+                ),
+            }
 
         # Portfolio heat check
         if not self.portfolio_heat_ok(portfolio_value, open_positions):
