@@ -47,6 +47,10 @@ class RiskManager:
         # State
         self.is_paused: bool = False
         self.kill_switch_active: bool = False
+        self.kill_switch_activated_at = None   # datetime when kill switch fired
+        self.auto_resume_cooldown_min: int = int(
+            __import__("os").getenv("AUTO_RESUME_COOLDOWN_MIN", "30")
+        )  # minutes before auto-resume check begins
         self._news_intel = None
 
         # Portfolio heat tracking (total % at risk across all open positions)
@@ -359,6 +363,9 @@ class RiskManager:
         drawdown = (peak - current_value) / peak
 
         if drawdown >= self.cfg.MAX_PORTFOLIO_DRAWDOWN:
+            if not self.kill_switch_active:  # only set time on first trigger
+                from src.utils import utc_now
+                self.kill_switch_activated_at = utc_now()
             self.kill_switch_active = True
             return {"drawdown_pct": drawdown, "action": "KILL_SWITCH"}
         elif drawdown >= self.cfg.CIRCUIT_BREAKER_3:  # 15%
@@ -373,8 +380,9 @@ class RiskManager:
         return {"drawdown_pct": drawdown, "action": "NONE"}
 
     def reset_kill_switch(self):
-        """Reset kill switch. Called by /resume command."""
+        """Reset kill switch — called by /resume or auto-resume logic."""
         self.kill_switch_active = False
+        self.kill_switch_activated_at = None
         self.position_size_modifier = 1.0
         logger.info("Kill switch reset. Trading resumed.")
 

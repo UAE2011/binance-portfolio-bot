@@ -705,13 +705,15 @@ def build_command_handlers(portfolio, risk_manager, calibrator,
     async def cmd_resume(args):
         risk_manager.is_paused = False
         risk_manager.kill_switch_active = False
+        risk_manager.kill_switch_activated_at = None
         risk_manager.position_size_modifier = 1.0
+        dd = risk_manager.check_drawdown(portfolio.portfolio_value, portfolio.peak_value)
         return (
             "✅ <b>Trading RESUMED</b>\n"
-            "Kill switch: <code>OFF</code>\n"
-            "Paused: <code>False</code>\n"
-            "Position modifier: <code>1.0×</code>\n\n"
-            "<i>Bot will begin scanning and trading on next cycle.</i>"
+            f"Current drawdown: <code>{dd.get('drawdown_pct', 0):.1%}</code>\n"
+            f"Portfolio: <code>${portfolio.portfolio_value:.2f}</code>\n\n"
+            "<i>Note: Kill switch auto-resumes when drawdown recovers below 10%.\n"
+            "Manual /resume only needed to force-override.</i>"
         )
 
     async def cmd_sell(args):

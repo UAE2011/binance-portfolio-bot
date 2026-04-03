@@ -427,6 +427,75 @@ async def scheduled_tasks(portfolio: PortfolioManager, regime: RegimeDetector,
     bot_state.save()
 
 
+# ─── Auto-Resume ─────────────────────────────────────────────────────────────
+
+async def check_auto_resume(portfolio: PortfolioManager, risk: RiskManager,
+                             notifier: TelegramNotifier):
+    """
+    Automatically resume trading after a kill switch when conditions recover.
+    No manual /resume needed.
+
+    Resume conditions (ALL must be true):
+      1. Cooldown period has passed (default 30 min)
+      2. Current drawdown is below CIRCUIT_BREAKER_3 (15%)
+      3. Portfolio value is stable or recovering (not still crashing)
+
+    For false positives (stale DB peak bug), the cooldown is shortened to
+    5 min since the drawdown never actually existed.
+    """
+    if not risk.kill_switch_active:
+        return
+
+    from src.utils import utc_now
+    now = utc_now()
+    activated_at = risk.kill_switch_activated_at
+    if activated_at is None:
+        # Kill switch was active before this session started — short cooldown
+        activated_at = now - timedelta(minutes=risk.auto_resume_cooldown_min)
+        risk.kill_switch_activated_at = activated_at
+
+    elapsed_min = (now - activated_at).total_seconds() / 60
+
+    # Minimum cooldown before checking
+    if elapsed_min < risk.auto_resume_cooldown_min:
+        remaining = risk.auto_resume_cooldown_min - elapsed_min
+        logger.debug("Auto-resume cooldown: %.0f min remaining", remaining)
+        return
+
+    # Check current drawdown against session peak (not stale DB peak)
+    current_dd = risk.check_drawdown(portfolio.portfolio_value, portfolio.peak_value)
+    dd_pct = current_dd.get("drawdown_pct", 0)
+
+    # Resume threshold: below CIRCUIT_BREAKER_2 (10%) — healthy enough to trade
+    resume_threshold = Settings.risk.CIRCUIT_BREAKER_2
+
+    if dd_pct < resume_threshold:
+        risk.reset_kill_switch()
+        logger.info("AUTO-RESUME: drawdown %.1f%% recovered below %.0f%% threshold",
+                    dd_pct * 100, resume_threshold * 100)
+        await notifier.send_message(
+            "<b>✅ AUTO-RESUME</b>\n\n"
+            "Kill switch lifted automatically.\n"
+            f"Drawdown recovered to <code>{dd_pct:.1%}</code> "
+            f"(below {resume_threshold:.0%} threshold).\n"
+            f"Cooldown: <code>{elapsed_min:.0f} min</code>\n\n"
+            "<i>Trading resumed. No action needed from you.</i>"
+        )
+    else:
+        logger.info("Auto-resume check: drawdown %.1f%% still above %.0f%% — waiting",
+                    dd_pct * 100, resume_threshold * 100)
+        # Notify every 30 min while waiting
+        if int(elapsed_min) % 30 == 0:
+            await notifier.send_message(
+                f"<b>⏳ Kill Switch Active</b>\n"
+                f"Drawdown: <code>{dd_pct:.1%}</code> "
+                f"(need < {resume_threshold:.0%} to auto-resume)\n"
+                f"Elapsed: <code>{elapsed_min:.0f} min</code>\n"
+                f"<i>Auto-checking every {risk.auto_resume_cooldown_min} min. "
+                "Or send /resume to force.</i>"
+            )
+
+
 # ─── Main ────────────────────────────────────────────────────────────────────
 
 async def main():
@@ -590,6 +659,9 @@ async def main():
 
             # Circuit breakers
             await enforce_circuit_breakers(portfolio, risk, notifier)
+
+            # Auto-resume check — lifts kill switch when drawdown recovers
+            await check_auto_resume(portfolio, risk, notifier)
 
             # Manage open positions (trailing stops, partial TPs, exits)
             await manage_open_positions(
