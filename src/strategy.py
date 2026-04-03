@@ -1,8 +1,9 @@
 """
-Strategy Module — AGGRESSIVE short-term confluence scoring.
+Strategy Module — SCALPING MODE (1m / 5m / 15m).
 
-Loosened gates for fast scalping/swing trades. Fewer confirmation layers,
-lower thresholds, AI advisory (non-blocking), and rapid signal generation.
+Ultra-fast signal generation for short-term opportunities.
+Minimal gates, low threshold (35/100), rapid entries.
+Designed to capture 0.3-1.5% moves multiple times per day.
 """
 
 import json
@@ -41,8 +42,8 @@ class SupportResistanceEngine:
         swing_highs += wick_swings_h["swing_highs"]
         swing_lows += wick_swings_l["swing_lows"]
 
-        resistance_zones = cluster_levels(swing_highs, threshold_pct=0.005)
-        support_zones = cluster_levels(swing_lows, threshold_pct=0.005)
+        resistance_zones = cluster_levels(swing_highs, threshold_pct=0.003)
+        support_zones = cluster_levels(swing_lows, threshold_pct=0.003)
 
         current_price = closes[-1]
 
@@ -96,7 +97,7 @@ class SupportResistanceEngine:
         if nearest is None:
             return False
         distance_pct = abs(current_price - nearest["level"]) / nearest["level"]
-        return distance_pct <= Settings.strategy.SR_PROXIMITY_PCT
+        return distance_pct <= 0.015  # 1.5% proximity for scalping
 
     def get_support_prices(self, symbol: str) -> list:
         return [z["level"] for z in self.levels_cache.get(symbol, {}).get("support", [])]
@@ -146,20 +147,21 @@ class VolumeSpikeDetector:
 
 
 # ---------------------------------------------------------------------------
-# Confluence Scorer — AGGRESSIVE (loosened)
+# Confluence Scorer — SCALPING MODE
 # ---------------------------------------------------------------------------
 
 class ConfluenceScorer:
     """
-    100-point confluence scoring — AGGRESSIVE mode.
+    100-point confluence scoring — SCALPING mode.
 
-    Key changes from conservative mode:
-    - Technical score still dominates (50 pts) but easier to achieve
-    - Regime score reduced (15 pts) — sideways markets still allowed
-    - Sentiment reduced (10 pts) — don't over-filter on news
-    - Volume gives points even without spikes (15 pts)
-    - Risk/reward still matters (10 pts)
-    - Threshold lowered to 45 (from 70) via .env
+    Scoring breakdown:
+    - Technical (50 pts): RSI, MACD, EMA, Bollinger, S/R, entry TF
+    - Momentum (20 pts): Price action, candle patterns, micro-trend
+    - Volume (15 pts): Volume confirmation with generous scoring
+    - Regime (10 pts): Soft bonus, never blocks
+    - Sentiment (5 pts): Minimal weight — technicals dominate
+
+    Threshold: 35/100 (ultra-low for maximum opportunity capture)
     """
 
     def __init__(self, regime_detector, news_intel, database, sr_engine: SupportResistanceEngine):
@@ -174,32 +176,32 @@ class ConfluenceScorer:
         breakdown = {}
         total = 0
 
-        # 1. Technical Score (50 points) — easier to achieve
+        # 1. Technical Score (50 points)
         tech_score, tech_detail = self._technical_score(
             symbol, indicators_primary, indicators_entry, indicators_trend, kline_history,
         )
         breakdown["technical"] = {"score": tech_score, "max": 50, "details": tech_detail}
         total += tech_score
 
-        # 2. Regime Score (15 points) — sideways still gets points
-        regime_score = self._regime_score()
-        breakdown["regime"] = {"score": regime_score, "max": 15}
-        total += regime_score
+        # 2. Momentum Score (20 points) — NEW: price action micro-patterns
+        mom_score, mom_detail = self._momentum_score(indicators_entry, indicators_primary, kline_history)
+        breakdown["momentum"] = {"score": mom_score, "max": 20, "details": mom_detail}
+        total += mom_score
 
-        # 3. Sentiment Score (10 points) — reduced weight
-        sentiment_score = self._sentiment_score()
-        breakdown["sentiment"] = {"score": sentiment_score, "max": 10}
-        total += sentiment_score
-
-        # 4. Volume Score (15 points) — gives partial credit
+        # 3. Volume Score (15 points)
         volume_score, vol_detail = self._volume_score(indicators_primary)
         breakdown["volume"] = {"score": volume_score, "max": 15, "details": vol_detail}
         total += volume_score
 
-        # 5. Risk/Reward Score (10 points)
-        rr_score, rr_detail = self._risk_reward_score(symbol, indicators_primary)
-        breakdown["risk_reward"] = {"score": rr_score, "max": 10, "details": rr_detail}
-        total += rr_score
+        # 4. Regime Score (10 points) — soft bonus
+        regime_score = self._regime_score()
+        breakdown["regime"] = {"score": regime_score, "max": 10}
+        total += regime_score
+
+        # 5. Sentiment Score (5 points) — minimal weight
+        sentiment_score = self._sentiment_score()
+        breakdown["sentiment"] = {"score": sentiment_score, "max": 5}
+        total += sentiment_score
 
         threshold = regime_params.get("confluence_threshold",
                                        Settings.strategy.CONFLUENCE_SCORE_THRESHOLD)
@@ -227,78 +229,94 @@ class ConfluenceScorer:
         details = {}
         price = ind_primary.get("close", 0)
 
-        # --- RSI (15 pts) — wider acceptable range ---
+        # --- RSI (12 pts) — fast RSI, wider acceptable range ---
         rsi = ind_primary.get("rsi", 50)
-        if 25 <= rsi <= 45:
-            rsi_score = 15
-            details["rsi"] = f"RSI={rsi:.1f} (oversold recovery — strong buy zone)"
-        elif 45 < rsi <= 60:
+        if 20 <= rsi <= 40:
             rsi_score = 12
-            details["rsi"] = f"RSI={rsi:.1f} (momentum zone — good)"
-        elif 20 <= rsi < 25:
+            details["rsi"] = f"RSI={rsi:.1f} (oversold — strong buy)"
+        elif 40 < rsi <= 55:
             rsi_score = 10
-            details["rsi"] = f"RSI={rsi:.1f} (deep oversold — reversal play)"
-        elif 60 < rsi <= 70:
-            rsi_score = 6
-            details["rsi"] = f"RSI={rsi:.1f} (strong momentum — still tradeable)"
-        elif rsi > 75:
-            rsi_score = 0
-            details["rsi"] = f"RSI={rsi:.1f} (overbought — skip)"
-        else:
+            details["rsi"] = f"RSI={rsi:.1f} (momentum zone)"
+        elif 55 < rsi <= 65:
+            rsi_score = 7
+            details["rsi"] = f"RSI={rsi:.1f} (strong momentum)"
+        elif 65 < rsi <= 75:
             rsi_score = 4
-            details["rsi"] = f"RSI={rsi:.1f}"
+            details["rsi"] = f"RSI={rsi:.1f} (hot but tradeable)"
+        elif rsi < 20:
+            rsi_score = 8
+            details["rsi"] = f"RSI={rsi:.1f} (extreme oversold — risky bounce)"
+        else:
+            rsi_score = 2
+            details["rsi"] = f"RSI={rsi:.1f} (overbought — small position only)"
         score += rsi_score
 
-        # --- MACD (15 pts) — more generous scoring ---
+        # --- MACD (12 pts) — fast MACD (5,13,4) ---
         macd_hist = ind_primary.get("macd_histogram", 0)
         macd_line = ind_primary.get("macd", 0)
         macd_signal = ind_primary.get("macd_signal", 0)
         if macd_line > macd_signal and macd_hist > 0:
-            macd_score = 15
+            macd_score = 12
             details["macd"] = "MACD bullish crossover + positive histogram"
         elif macd_hist > 0:
-            macd_score = 10
-            details["macd"] = "MACD histogram positive (momentum building)"
+            macd_score = 9
+            details["macd"] = "MACD histogram positive"
         elif macd_line > macd_signal:
-            macd_score = 8
+            macd_score = 7
             details["macd"] = "MACD above signal (early bullish)"
         elif macd_hist > ind_primary.get("prev_macd_histogram", macd_hist - 1):
             macd_score = 5
-            details["macd"] = "MACD histogram improving (turning bullish)"
+            details["macd"] = "MACD improving (turning bullish)"
         else:
-            macd_score = 0
-            details["macd"] = "MACD bearish"
+            macd_score = 2
+            details["macd"] = "MACD bearish (small base points)"
         score += macd_score
 
-        # --- EMA alignment + Bollinger (10 pts) ---
+        # --- EMA alignment (8 pts) ---
         ema_score = 0
         ema9 = ind_primary.get("ema9", 0)
         ema21 = ind_primary.get("ema21", 0)
-        bb_lower = ind_primary.get("bb_lower", 0)
 
         if price > ema9 > ema21 and ema9 > 0:
-            ema_score += 5
+            ema_score = 8
             details["ema"] = "Price > EMA9 > EMA21 (perfect alignment)"
         elif price > ema21 and ema21 > 0:
-            ema_score += 4
+            ema_score = 6
             details["ema"] = "Price above EMA21 (trend intact)"
         elif price > ema9 and ema9 > 0:
-            ema_score += 3
+            ema_score = 5
             details["ema"] = "Price above EMA9 (short-term bullish)"
+        elif ema9 > 0 and abs(price - ema9) / ema9 < 0.003:
+            ema_score = 4
+            details["ema"] = "Price at EMA9 (potential bounce)"
         else:
-            ema_score += 0
-            details["ema"] = "Below EMAs"
+            ema_score = 2
+            details["ema"] = "Below EMAs (base points)"
+        score += ema_score
 
-        # Bollinger bounce — great short-term signal
-        if bb_lower > 0 and price <= bb_lower * 1.005:
-            ema_score += 5
-            details["bollinger"] = "At lower Bollinger band (bounce setup!)"
-        elif bb_lower > 0 and price <= bb_lower * 1.015:
-            ema_score += 3
+        # --- Bollinger Bands (8 pts) ---
+        bb_lower = ind_primary.get("bb_lower", 0)
+        bb_upper = ind_primary.get("bb_upper", 0)
+        bb_mid = ind_primary.get("bb_middle", 0)
+        bb_score = 0
+        if bb_lower > 0 and price <= bb_lower * 1.002:
+            bb_score = 8
+            details["bollinger"] = "AT lower Bollinger band (bounce!)"
+        elif bb_lower > 0 and price <= bb_lower * 1.01:
+            bb_score = 6
             details["bollinger"] = "Near lower Bollinger band"
-        score += min(ema_score, 10)
+        elif bb_mid > 0 and price < bb_mid:
+            bb_score = 4
+            details["bollinger"] = "Below BB midline (room to run)"
+        elif bb_upper > 0 and price < bb_upper:
+            bb_score = 2
+            details["bollinger"] = "Between mid and upper BB"
+        else:
+            bb_score = 1
+            details["bollinger"] = "Above upper BB"
+        score += bb_score
 
-        # --- S/R proximity bonus (5 pts) ---
+        # --- S/R proximity (5 pts) ---
         sr_score = 0
         if self.sr.is_near_support(symbol, price):
             nearest = self.sr.get_nearest_support(symbol, price)
@@ -306,35 +324,106 @@ class ConfluenceScorer:
                 sr_score = 5
                 details["sr"] = f"Near support ${nearest['level']:.4f}"
         else:
-            # Still give points if there's room to resistance
             res = self.sr.get_nearest_resistance(symbol, price)
             if res:
                 dist = (res["level"] - price) / price if price > 0 else 1
-                if dist > 0.03:
+                if dist > 0.02:
                     sr_score = 3
-                    details["sr"] = f"Room to resistance ({dist:.1%} away)"
+                    details["sr"] = f"Room to resistance ({dist:.1%})"
                 else:
                     sr_score = 1
                     details["sr"] = "Close to resistance"
+            else:
+                sr_score = 2
+                details["sr"] = "No clear S/R (neutral)"
         score += sr_score
 
-        # --- Entry timeframe momentum bonus (5 pts) ---
+        # --- Entry timeframe confirmation (5 pts) ---
         entry_rsi = ind_entry.get("rsi", 50)
         entry_close = ind_entry.get("close", 0)
         entry_ema9 = ind_entry.get("ema9", 0)
         entry_bonus = 0
         if entry_close > entry_ema9 and entry_ema9 > 0:
             entry_bonus += 3
-            details["entry_tf"] = "Entry TF price > EMA9 (timing confirmed)"
-        if 30 <= entry_rsi <= 60:
+            details["entry_tf"] = "Entry TF price > EMA9"
+        else:
+            entry_bonus += 1
+            details["entry_tf"] = "Entry TF neutral"
+        if 25 <= entry_rsi <= 60:
             entry_bonus += 2
-            details["entry_rsi"] = f"Entry TF RSI={entry_rsi:.0f} (good zone)"
+            details["entry_rsi"] = f"Entry RSI={entry_rsi:.0f} (good)"
+        else:
+            entry_bonus += 1
+            details["entry_rsi"] = f"Entry RSI={entry_rsi:.0f}"
         score += min(entry_bonus, 5)
 
-        # --- RSI divergence bonus (up to +3) ---
-        closes = [k["close"] for k in history] if history else []
-        if len(closes) >= 20:
+        return min(score, 50), details
+
+    def _momentum_score(self, ind_entry: dict, ind_primary: dict, history: list) -> tuple:
+        """NEW: Price action and micro-momentum scoring for scalping."""
+        score = 0
+        details = {}
+
+        # --- Green candle streak (6 pts) ---
+        if history and len(history) >= 3:
+            green_count = 0
+            for k in history[-5:]:
+                if k.get("close", 0) > k.get("open", 0):
+                    green_count += 1
+            if green_count >= 4:
+                score += 6
+                details["candles"] = f"{green_count}/5 green candles (strong momentum)"
+            elif green_count >= 3:
+                score += 4
+                details["candles"] = f"{green_count}/5 green candles (building)"
+            elif green_count >= 2:
+                score += 2
+                details["candles"] = f"{green_count}/5 green candles"
+            else:
+                score += 1
+                details["candles"] = f"{green_count}/5 green candles (base)"
+
+        # --- Price acceleration (7 pts) ---
+        if history and len(history) >= 10:
+            closes = [k["close"] for k in history]
+            recent_5 = closes[-5:]
+            prior_5 = closes[-10:-5]
+            recent_change = (recent_5[-1] - recent_5[0]) / recent_5[0] if recent_5[0] > 0 else 0
+            prior_change = (prior_5[-1] - prior_5[0]) / prior_5[0] if prior_5[0] > 0 else 0
+
+            if recent_change > 0 and recent_change > prior_change:
+                score += 7
+                details["acceleration"] = f"Price accelerating +{recent_change:.2%}"
+            elif recent_change > 0:
+                score += 5
+                details["acceleration"] = f"Price rising +{recent_change:.2%}"
+            elif recent_change > -0.005:
+                score += 3
+                details["acceleration"] = "Price stable (potential breakout)"
+            else:
+                score += 1
+                details["acceleration"] = f"Price declining {recent_change:.2%} (base)"
+
+        # --- StochRSI oversold bounce (4 pts) ---
+        stoch_k = ind_primary.get("stoch_rsi_k", 50)
+        stoch_d = ind_primary.get("stoch_rsi_d", 50)
+        if stoch_k < 25:
+            score += 4
+            details["stochrsi"] = f"StochRSI K={stoch_k:.0f} (oversold — bounce setup)"
+        elif stoch_k < 40 and stoch_k > stoch_d:
+            score += 3
+            details["stochrsi"] = f"StochRSI K={stoch_k:.0f} crossing up"
+        elif stoch_k < 60:
+            score += 2
+            details["stochrsi"] = f"StochRSI K={stoch_k:.0f} (neutral)"
+        else:
+            score += 1
+            details["stochrsi"] = f"StochRSI K={stoch_k:.0f}"
+
+        # --- RSI divergence bonus (3 pts) ---
+        if history and len(history) >= 20:
             try:
+                closes = [k["close"] for k in history]
                 from src.indicators import IncrementalRSI
                 rsi_calc = IncrementalRSI(Settings.strategy.RSI_PERIOD)
                 rsi_values = []
@@ -343,30 +432,31 @@ class ConfluenceScorer:
                     rsi_values.append(rsi_calc.value)
                 if detect_rsi_divergence(closes, rsi_values):
                     score += 3
-                    details["divergence"] = "Bullish RSI divergence (+3 bonus)"
+                    details["divergence"] = "Bullish RSI divergence (+3)"
             except Exception:
                 pass
 
-        return min(score, 50), details
+        return min(score, 20), details
 
     def _regime_score(self) -> int:
-        """Sideways markets still get decent points — we trade in all conditions."""
+        """Soft bonus — never blocks. Even BEAR gets base points."""
         regime_map = {
-            "BULL": 15,
-            "SIDEWAYS": 10,
-            "HIGH_VOLATILITY": 7,
-            "BEAR": 3,
+            "BULL": 10,
+            "SIDEWAYS": 8,
+            "HIGH_VOLATILITY": 6,
+            "BEAR": 4,
         }
         return regime_map.get(self.regime.current_regime, 5)
 
     def _sentiment_score(self) -> int:
-        """Reduced weight — don't let sentiment block good technical setups."""
+        """Minimal weight — technicals dominate in scalping."""
         raw = self.news.get_sentiment_points()
-        # Scale from 0-15 range down to 0-10
-        return min(int(raw * 10 / 15), 10)
+        # Scale from 0-15 range down to 0-5, minimum 2 base points
+        scaled = min(int(raw * 5 / 15), 5)
+        return max(scaled, 2)
 
     def _volume_score(self, ind: dict) -> tuple:
-        """More generous — give partial credit even without a spike."""
+        """Generous scoring — give base points even without spike."""
         volume = ind.get("volume", 0)
         vol_sma = ind.get("volume_sma", 1)
         spike = VolumeSpikeDetector.detect_spike(volume, vol_sma)
@@ -379,53 +469,27 @@ class ConfluenceScorer:
             else:
                 return 10, f"Volume spike {spike['ratio']:.1f}x"
         elif spike["ratio"] > 1.0:
-            return 7, f"Volume {spike['ratio']:.1f}x avg (above normal)"
+            return 8, f"Volume {spike['ratio']:.1f}x avg (above normal)"
         elif spike["ratio"] > 0.7:
-            return 4, f"Volume {spike['ratio']:.1f}x avg (acceptable)"
+            return 5, f"Volume {spike['ratio']:.1f}x avg (acceptable)"
+        elif spike["ratio"] > 0.4:
+            return 3, f"Volume {spike['ratio']:.1f}x avg (low but not blocking)"
         else:
-            return 2, f"Volume {spike['ratio']:.1f}x avg (low but not blocking)"
-
-    def _risk_reward_score(self, symbol: str, ind: dict) -> tuple:
-        price = ind.get("close", 0)
-        if price == 0:
-            return 0, "Price unavailable"
-
-        sl_pct = Settings.risk.STOP_LOSS_PCT
-        tp_pct = Settings.risk.TAKE_PROFIT_PCT
-        rr = tp_pct / sl_pct if sl_pct > 0 else 0
-
-        nearest_support = self.sr.get_nearest_support(symbol, price)
-        if nearest_support:
-            support_dist = (price - nearest_support["level"]) / price
-            if 0 < support_dist < sl_pct:
-                effective_rr = tp_pct / support_dist
-                if effective_rr > rr:
-                    rr = effective_rr
-
-        if rr > 2.5:
-            return 10, f"R:R = {rr:.1f}:1 (excellent)"
-        elif rr > 1.5:
-            return 7, f"R:R = {rr:.1f}:1 (good)"
-        elif rr > 1.0:
-            return 5, f"R:R = {rr:.1f}:1 (acceptable)"
-        else:
-            return 3, f"R:R = {rr:.1f}:1 (tight but tradeable)"
+            return 2, f"Volume {spike['ratio']:.1f}x avg (base points)"
 
 
 # ---------------------------------------------------------------------------
-# Signal Generator — AGGRESSIVE (fewer gates)
+# Signal Generator — SCALPING MODE (no hard gates)
 # ---------------------------------------------------------------------------
 
 class SignalGenerator:
     """
-    Generates trade signals — AGGRESSIVE mode.
+    Generates trade signals — SCALPING mode.
 
-    Only 2 hard gates remain:
-    1. Regime must not be deep BEAR (still allows SIDEWAYS, HIGH_VOL)
-    2. Confluence score must pass threshold (lowered to 45)
-
-    AI is advisory only (no veto power by default).
-    No extreme greed block. No 4h SMA50 gate. No 15m EMA9 gate.
+    NO hard gates at all. Every asset gets scored.
+    Only the confluence threshold determines if a trade happens.
+    AI is advisory only (never blocks).
+    Designed for maximum opportunity capture.
     """
 
     def __init__(self, scorer: ConfluenceScorer, regime_detector, news_intel,
@@ -439,15 +503,10 @@ class SignalGenerator:
                        indicators_primary: dict, indicators_trend: dict,
                        kline_history: list,
                        portfolio_context: dict = None) -> Optional[dict]:
-        """Streamlined evaluation: confluence score -> optional AI -> signal."""
+        """Streamlined evaluation: score everything, no gates, just threshold."""
         regime_params = self.regime.get_regime_params()
 
-        # Gate 1: Only block in confirmed deep BEAR with no recovery signs
-        if self.regime.current_regime == "BEAR":
-            bear_rsi = indicators_primary.get("rsi", 50)
-            # Even in bear, allow oversold bounces (RSI < 35)
-            if bear_rsi > 40 and not regime_params.get("entries_allowed", False):
-                return None
+        # NO GATES — every asset gets scored regardless of regime, sentiment, etc.
 
         # Score the setup
         result = self.scorer.score(
@@ -461,14 +520,17 @@ class SignalGenerator:
         price = indicators_primary.get("close", 0)
         atr = indicators_primary.get("atr", 0)
 
-        # Build signal
+        # Build signal with scalping-optimized SL/TP
+        sl_pct = Settings.risk.STOP_LOSS_PCT      # 0.02 (2%)
+        tp_pct = Settings.risk.TAKE_PROFIT_PCT     # 0.03 (3%)
+
         signal = {
             "symbol": symbol,
             "price": price,
             "confluence_score": result["total_score"],
             "breakdown": result["breakdown"],
-            "stop_loss": price * (1 - Settings.risk.STOP_LOSS_PCT),
-            "take_profit": price * (1 + Settings.risk.TAKE_PROFIT_PCT),
+            "stop_loss": price * (1 - sl_pct),
+            "take_profit": price * (1 + tp_pct),
             "atr": atr,
             "regime": self.regime.current_regime,
             "fear_greed": self.news.fear_greed_value,
@@ -481,7 +543,7 @@ class SignalGenerator:
             "resistance_levels": self.scorer.sr.get_resistance_prices(symbol),
         }
 
-        # AI analysis — advisory only, does NOT block trades unless AI_VETO_POWER=true
+        # AI analysis — ADVISORY ONLY, never blocks
         if self.ai and Settings.ai.ENABLED:
             try:
                 recent_news = self.news.get_top_headlines(5)
@@ -496,23 +558,11 @@ class SignalGenerator:
                     recent_news=recent_news,
                     portfolio_context=portfolio_context or {},
                 )
-                approval = self.ai.should_approve_entry(ai_result, result["total_score"])
                 signal["ai_analysis"] = ai_result
-                signal["ai_approval"] = approval
+                signal["ai_approval"] = {"approved": True, "reason": "Advisory mode — AI does not block"}
 
-                # Only block if AI_VETO_POWER is explicitly enabled
-                if Settings.ai.VETO_POWER and not approval["approved"]:
-                    logger.info("AI vetoed %s: %s", symbol, approval["reason"])
-                    self.scorer.db.save_signal({
-                        "timestamp": utc_now(), "symbol": symbol,
-                        "confluence_score": result["total_score"],
-                        "score_breakdown": json.dumps(result["breakdown"]),
-                        "action_taken": "AI_VETOED",
-                        "regime": self.regime.current_regime,
-                    })
-                    return None
-
-                # AI can still suggest tighter SL/TP even in advisory mode
+                # AI can suggest tighter SL/TP
+                approval = self.ai.should_approve_entry(ai_result, result["total_score"])
                 if approval.get("ai_sl"):
                     ai_sl = price * (1 - approval["ai_sl"])
                     signal["stop_loss"] = max(signal["stop_loss"], ai_sl)

@@ -112,9 +112,10 @@ class BinanceExchange:
         backoff = 1
         for attempt in range(4):
             try:
+                # Binance requires ALL params (including POST/DELETE) as query string
+                query_url = f"{url}?{urlencode(params)}" if params else url
                 async with self.session.request(
-                    method, url, params=params if method == "GET" else None,
-                    data=params if method == "POST" else None,
+                    method, query_url,
                     headers=self._headers(), timeout=aiohttp.ClientTimeout(total=10)
                 ) as resp:
                     weight = resp.headers.get("X-MBX-USED-WEIGHT-1M", "0")

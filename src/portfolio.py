@@ -94,8 +94,8 @@ class PortfolioManager:
         )
         position_size = min(position_size, self.cash_available * 0.95)
 
-        if position_size < 20:
-            logger.info("Position size too small for %s: $%.2f", symbol, position_size)
+        if position_size < 11:
+            logger.info("Position size too small for %s: $%.2f (min $11)", symbol, position_size)
             return None
 
         result = await self.exchange.place_market_buy(symbol, position_size)
@@ -271,7 +271,7 @@ class PortfolioManager:
                 if min_len < 10:
                     continue
                 corr = np.corrcoef(new_returns[-min_len:], pos_returns[-min_len:])[0, 1]
-                if abs(corr) > 0.85:
+                if abs(corr) > 0.95:  # Relaxed — crypto is inherently correlated
                     logger.info(
                         "High correlation (%.2f) between %s and %s",
                         corr, new_symbol, pos["symbol"],
@@ -321,7 +321,7 @@ class PortfolioManager:
                     r2 = np.diff([k["close"] for k in p2]) / [k["close"] for k in p2[:-1]]
                     ml = min(len(r1), len(r2))
                     corr = np.corrcoef(r1[-ml:], r2[-ml:])[0, 1]
-                    if abs(corr) > 0.85:
+                    if abs(corr) > 0.95:  # Relaxed — crypto is inherently correlated
                         smaller = pos if pos["usdt_value"] < other["usdt_value"] else other
                         sell_qty = smaller.get("remaining_quantity", smaller["quantity"]) * 0.5
                         actions.append({

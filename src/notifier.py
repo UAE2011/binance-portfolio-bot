@@ -819,6 +819,67 @@ def build_command_handlers(portfolio, risk_manager, calibrator, watchdog,
                 f"Win Rate: <code>{wr}</code>"
             )
 
+    async def cmd_debug(args):
+        """Debug: show exactly why trades are/aren't executing."""
+        lines = ["<b>DEBUG — TRADE CYCLE STATUS</b>\n"]
+
+        # 1. Kill switch / pause
+        lines.append(f"Kill Switch: {'ACTIVE' if risk_manager.kill_switch_active else 'OFF'}")
+        lines.append(f"Paused: {'YES' if risk_manager.is_paused else 'NO'}")
+
+        # 2. Regime
+        r = regime.get_regime_params()
+        lines.append(f"\nRegime: {regime.current_regime}")
+        lines.append(f"Position Mult: {r.get('position_multiplier', 'N/A')}")
+        lines.append(f"Max Exposure: {r.get('max_exposure', 'N/A')}")
+
+        # 3. Portfolio state
+        s = portfolio.get_status()
+        lines.append(f"\nPortfolio Value: ${s.get('total_value', 0):,.2f}")
+        lines.append(f"Cash Available: ${s.get('cash', 0):,.2f}")
+        lines.append(f"Open Positions: {s.get('open_positions', 0)}")
+        lines.append(f"Max Positions: {Settings.risk.MAX_OPEN_POSITIONS}")
+
+        # 4. Can open position check
+        check = risk_manager.can_open_position(
+            s.get('total_value', 0),
+            s.get('cash', 0),
+            s.get('open_positions', 0),
+            'layer1',  # test sector
+            s.get('sector_exposure', {}),
+        )
+        lines.append(f"\nCan Open Position: {'YES' if check['allowed'] else 'NO'}")
+        lines.append(f"Reason: {check['reason']}")
+
+        # 5. Daily loss
+        daily_loss = risk_manager.check_daily_loss_limit()
+        lines.append(f"Daily Loss Limit Hit: {'YES' if daily_loss else 'NO'}")
+
+        # 6. Drawdown
+        dd = risk_manager.check_drawdown(s.get('total_value', 0))
+        lines.append(f"Drawdown: {dd['drawdown_pct']*100:.2f}%")
+        lines.append(f"Drawdown Action: {dd['action']}")
+
+        # 7. AI status
+        ai_s = ai.get_status()
+        lines.append(f"\nAI Enabled: {ai_s.get('enabled')}")
+        lines.append(f"AI Calls Today: {ai_s.get('daily_calls', 0)}/{ai_s.get('max_daily_calls', 0)}")
+        lines.append(f"AI Veto Power: {ai_s.get('veto_power')}")
+        lines.append(f"AI Strong Model: {ai_s.get('strong_model', 'N/A')}")
+        lines.append(f"AI Fast Model: {ai_s.get('fast_model', 'N/A')}")
+
+        # 8. Strategy config
+        lines.append(f"\nConfluence Threshold: {Settings.strategy.CONFLUENCE_SCORE_THRESHOLD}")
+        lines.append(f"Scan Interval: {Settings.strategy.SCAN_INTERVAL_SECONDS}s")
+        lines.append(f"Timeframes: {Settings.strategy.TIMEFRAMES}")
+        lines.append(f"Min Volume: ${Settings.strategy.MIN_24H_VOLUME:,.0f}")
+
+        # 9. Watchlist size
+        wl_size = len(portfolio.open_positions)  # approximate
+        lines.append(f"\nPositions Held: {len(portfolio.open_positions)}")
+
+        return "\n".join(lines)
+
     async def cmd_help(args):
         return (
             "<b>COMMANDS</b>\n\n"
@@ -835,7 +896,8 @@ def build_command_handlers(portfolio, risk_manager, calibrator, watchdog,
             "/news - Latest news\n"
             "/ai - AI advisor status\n"
             "/risk - Risk metrics\n"
-            "/health - System health\n\n"
+            "/health - System health\n"
+            "/debug - Trade cycle debug\n\n"
             "<b>Actions</b>\n"
             "/pause - Pause trading\n"
             "/resume - Resume trading\n"
@@ -863,5 +925,6 @@ def build_command_handlers(portfolio, risk_manager, calibrator, watchdog,
         "/health": cmd_health,
         "/report": cmd_report,
         "/weekly": cmd_weekly,
+        "/debug": cmd_debug,
         "/help": cmd_help,
     }

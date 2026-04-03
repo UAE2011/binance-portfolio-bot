@@ -256,11 +256,16 @@ class TradingBot:
             f"Seeding indicators for all timeframes..."
         )
 
-        # Seed indicators for all timeframes
+        # Seed indicators for all timeframes (batched to avoid rate limits)
         seeded = 0
-        for symbol in self.watchlist:
-            await self._seed_indicators(symbol)
-            seeded += 1
+        batch_size = 5
+        for i in range(0, len(self.watchlist), batch_size):
+            batch = self.watchlist[i:i + batch_size]
+            for symbol in batch:
+                await self._seed_indicators(symbol)
+                seeded += 1
+            logger.info("Seeded %d/%d symbols...", seeded, len(self.watchlist))
+            await asyncio.sleep(2)  # 2s pause between batches to respect rate limits
 
         # Compute S/R levels for all watchlist symbols
         for symbol in self.watchlist:
@@ -372,9 +377,8 @@ class TradingBot:
             return
 
         regime_params = self.regime.get_regime_params()
-        if not regime_params.get("entries_allowed", False):
-            logger.info("Cycle %d: Regime blocking entries — skipping", self._cycle_count)
-            return
+        # Regime NEVER blocks entries — it only adjusts position sizing
+        # entries_allowed is always True in aggressive mode
 
         # Refresh higher timeframes
         await self._refresh_higher_timeframes()
@@ -443,29 +447,41 @@ class TradingBot:
         }
 
     async def _refresh_higher_timeframes(self):
-        """Refresh primary and trend timeframe indicators from REST API."""
+        """Refresh primary and trend timeframe indicators from REST API.
+        Only refreshes every 5 minutes to avoid rate limits.
+        Processes in batches of 10 with 1s delay between batches.
+        """
+        now = time.time()
+        if now - getattr(self, '_last_tf_refresh', 0) < 300:  # 5 min cooldown
+            return
+        self._last_tf_refresh = now
+
         primary_tf = Settings.strategy.PRIMARY_TIMEFRAME
         trend_tf = Settings.strategy.TREND_TIMEFRAME
 
-        for symbol in self.watchlist:
-            for tf in [primary_tf, trend_tf]:
-                try:
-                    klines = await self.exchange.get_klines(symbol, tf, 5)
-                    if not klines:
-                        continue
-                    ind_set = self.indicator_cache.get(symbol, {}).get(tf)
-                    if ind_set is None:
-                        continue
-                    history = self.kline_history.get(symbol, {}).get(tf, [])
-                    for k in klines:
-                        if not history or k["close"] != history[-1]["close"] or k["volume"] != history[-1]["volume"]:
-                            ind_set.update_candle(k)
-                            history.append(k)
-                            if len(history) > 200:
-                                history.pop(0)
-                    self.kline_history.setdefault(symbol, {})[tf] = history
-                except Exception as e:
-                    logger.debug("Refresh %s %s failed: %s", symbol, tf, e)
+        batch_size = 10
+        for i in range(0, len(self.watchlist), batch_size):
+            batch = self.watchlist[i:i + batch_size]
+            for symbol in batch:
+                for tf in [primary_tf, trend_tf]:
+                    try:
+                        klines = await self.exchange.get_klines(symbol, tf, 5)
+                        if not klines:
+                            continue
+                        ind_set = self.indicator_cache.get(symbol, {}).get(tf)
+                        if ind_set is None:
+                            continue
+                        history = self.kline_history.get(symbol, {}).get(tf, [])
+                        for k in klines:
+                            if not history or k["close"] != history[-1]["close"] or k["volume"] != history[-1]["volume"]:
+                                ind_set.update_candle(k)
+                                history.append(k)
+                                if len(history) > 200:
+                                    history.pop(0)
+                        self.kline_history.setdefault(symbol, {})[tf] = history
+                    except Exception as e:
+                        logger.debug("Refresh %s %s failed: %s", symbol, tf, e)
+            await asyncio.sleep(1)  # Rate limit: 1s between batches of 10
 
     # ------------------------------------------------------------------
     # Activity Feed Loop — Real-time Telegram updates

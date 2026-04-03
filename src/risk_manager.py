@@ -312,24 +312,25 @@ class RiskManager:
             return {"allowed": False, "reason": "Trading paused"}
 
         regime_params = self.regime.get_regime_params()
-        if not regime_params.get("entries_allowed", False):
-            return {"allowed": False, "reason": f"Entries blocked in {self.regime.current_regime} regime"}
+        # Regime never blocks entries — only adjusts position sizing
 
         if open_positions >= self.cfg.MAX_OPEN_POSITIONS:
             return {"allowed": False, "reason": f"Max positions ({self.cfg.MAX_OPEN_POSITIONS}) reached"}
 
         min_cash = portfolio_value * self.cfg.MIN_CASH_RESERVE
         if cash_available <= min_cash:
-            return {"allowed": False, "reason": "Below minimum cash reserve"}
+            # In aggressive mode, only block if truly out of cash
+            if cash_available < 15:
+                return {"allowed": False, "reason": "Insufficient cash (< $15)"}
 
         max_exposure = regime_params.get("max_exposure", 0.80)
         invested = portfolio_value - cash_available
         if portfolio_value > 0 and invested / portfolio_value >= max_exposure:
             return {"allowed": False, "reason": f"Max exposure ({max_exposure*100:.0f}%) reached"}
 
-        # Sector allocation check
+        # Sector allocation check — relaxed for aggressive mode (50% cap)
         sector_data = Settings.sectors().get("sectors", {}).get(sector, {})
-        max_sector = sector_data.get("max_allocation", 0.30)
+        max_sector = max(sector_data.get("max_allocation", 0.30), 0.50)
         current_sector = sector_exposure.get(sector, 0)
         if portfolio_value > 0 and current_sector / portfolio_value >= max_sector:
             return {"allowed": False, "reason": f"Sector {sector} at max allocation ({max_sector*100:.0f}%)"}
