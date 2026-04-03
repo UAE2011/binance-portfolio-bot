@@ -455,9 +455,6 @@ async def main():
     risk.set_news_intel(news)
     portfolio = PortfolioManager(exchange, db, regime, risk, news)
     ai = AIAdvisor()
-    alpha_hunter = AlphaHunter(
-        exchange, portfolio, risk, news, notifier, db
-    )
     sr_engine = SupportResistanceEngine()
     scorer = ConfluenceScorer(regime, news, db, sr_engine)
     signal_gen = SignalGenerator(scorer, regime, news, ai)
@@ -465,6 +462,9 @@ async def main():
     notifier = TelegramNotifier(Settings.telegram.BOT_TOKEN, Settings.telegram.CHAT_ID)
     watchdog = Watchdog(notifier)
     calibrator = Calibrator(db, risk, regime, notifier)
+    alpha_hunter = AlphaHunter(
+        exchange, portfolio, risk, news, notifier, db
+    )
     bot_state = BotState()
     bot_state.load()
 
