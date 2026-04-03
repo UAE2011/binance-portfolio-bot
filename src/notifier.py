@@ -368,19 +368,42 @@ def build_command_handlers(portfolio, risk_manager, calibrator,
                 pos_lines.append(f"  {arrow} {p['symbol']}: {pnl_pct:+.2f}%")
             except Exception:
                 pos_lines.append(f"  {p['symbol']}: N/A")
-        pos_text = "\n".join(pos_lines) if pos_lines else "  No open positions"
+        pos_text = "\n".join(pos_lines) if pos_lines else "  No active positions"
 
-        return (
+        # Sub-min positions
+        submin_lines = []
+        for p in portfolio.sub_min_positions[:5]:
+            try:
+                price = await portfolio.exchange.get_price(p["symbol"])
+                qty = p.get("remaining_quantity", p.get("quantity", 0))
+                val = qty * price
+                pnl_pct = ((price / p["entry_price"]) - 1) * 100 if p["entry_price"] > 0 else 0
+                submin_lines.append(
+                    f"  📌 {p['symbol']}: ${val:.2f} ({pnl_pct:+.1f}%) — waiting $10"
+                )
+            except Exception:
+                submin_lines.append(f"  📌 {p['symbol']}")
+        submin_text = "\n".join(submin_lines) if submin_lines else ""
+
+        sub_min_v = s.get("sub_min_value", 0)
+        deployable = s["cash_available"]
+        min_pos = max(11.0, s["portfolio_value"] * 0.01)
+        affordable = int(deployable / min_pos)
+
+        msg = (
             f"<b>📊 PORTFOLIO STATUS</b>\n\n"
-            f"Value:  <code>${s['portfolio_value']:.2f}</code>\n"
-            f"Cash:   <code>${s['cash_available']:.2f}</code>\n"
-            f"Invested: <code>${s['invested_value']:.2f}</code>\n"
+            f"Total:    <code>${s['portfolio_value']:.2f}</code>\n"
+            f"💵 Cash:  <code>${deployable:.2f}</code> (~{affordable} new positions)\n"
+            f"📈 Active: <code>${s['invested_value']:.2f}</code>\n"
+            f"📌 Sub-min: <code>${sub_min_v:.2f}</code> (locked, waiting)\n"
             f"Drawdown: <code>{s['drawdown']:.1%}</code>\n\n"
             f"Regime: {reg_e} <code>{regime.current_regime}</code>\n"
-            f"Mode:   {mode_e} <code>{regime.current_mode}</code>\n"
-            f"Confidence: <code>{regime.regime_confidence:.0%}</code>\n\n"
-            f"<b>Positions ({len(portfolio.open_positions)}):</b>\n<code>{pos_text}</code>"
+            f"Mode:   {mode_e} <code>{regime.current_mode}</code>\n\n"
+            f"<b>Active ({len(portfolio.open_positions)}):</b>\n<code>{pos_text}</code>"
         )
+        if submin_text:
+            msg += f"\n\n<b>Sub-min (can't sell yet):</b>\n<code>{submin_text}</code>"
+        return msg
 
     async def cmd_mode(args):
         """Show current operating mode with parameters."""

@@ -569,36 +569,33 @@ async def main():
     logger.info("[3/6] Syncing portfolio from DB...")
     await portfolio.sync_with_exchange()
 
-    # Reset stale historical peak so circuit breakers use today's actual value.
-    # Previous sessions (especially testnet) leave inflated peaks in the DB that
-    # cause false 30-40% drawdown readings on a perfectly healthy live portfolio.
+    # (Peak reset happens in step 4 after wallet reconciliation)
+
+    logger.info("[4/6] Reconciling wallet with DB...")
+    # Full wallet reconciliation in one pass:
+    # - Close DB entries where coin no longer in wallet (ghosts)
+    # - Sync quantities for existing DB positions
+    # - Import wallet positions not yet tracked in DB
+    # - Classify as ACTIVE (>=$10) or SUB_MIN (<$10 but real)
+    recon = await portfolio.reconcile_with_wallet()
+    await portfolio.sync_with_exchange()  # re-sync after reconciliation
+
+    # Reset peak AFTER reconciliation so it reflects true portfolio value
     db.reset_peak_to_current(portfolio.portfolio_value)
-    # Also reset the in-memory peak so sync_with_exchange() max() comparison
-    # never picks up the old inflated peak value from any prior session.
     portfolio.peak_value = portfolio.portfolio_value
-    logger.info("Peak reset to $%.2f (cleared stale DB history)", portfolio.portfolio_value)
+    logger.info("Peak reset to $%.2f | active=%d sub-min=%d ghosts=%d",
+                portfolio.portfolio_value, len(portfolio.open_positions),
+                len(portfolio.sub_min_positions), recon["ghosts"])
 
-    logger.info("[4/6] Scanning spot wallet for existing positions...")
-    # First clean up ghost positions from previous sessions
-    ghosts_cleaned = await portfolio.clean_ghost_positions()
-    if ghosts_cleaned > 0:
-        await portfolio.sync_with_exchange()  # refresh after cleanup
-
-    imported = await portfolio.import_spot_positions()
-
-    if imported:
-        # Re-sync after import so invested value is accurate
-        await portfolio.sync_with_exchange()
-        imported_lines = "\n".join(
-            f"  • {t['symbol']}: ${t['usdt_value']:.2f} | "
-            f"entry=${t['entry_price']:.4f} | SL=${t['stop_loss']:.4f}"
-            for t in imported[:8]
-        )
+    if recon["imported"] > 0 or recon["ghosts"] > 0:
+        active_n = len(portfolio.open_positions)
+        submin_n = len(portfolio.sub_min_positions)
         await notifier.send_message(
-            f"<b>📥 Imported {len(imported)} existing position(s) from wallet</b>\n\n"
-            f"<code>{imported_lines}</code>\n\n"
-            f"<i>These positions are now fully managed by the bot. "
-            f"Trailing stops and take-profit levels have been set automatically.</i>"
+            f"<b>📥 Wallet reconciled</b>\n"
+            f"Active positions: <code>{active_n}</code> (can trade)\n"
+            f"Sub-min positions: <code>{submin_n}</code> (waiting for recovery)\n"
+            f"Ghosts closed: <code>{recon['ghosts']}</code>\n"
+            f"Deployable cash: <code>${portfolio.cash_available:.2f}</code>"
         )
 
     logger.info("[5/6] Loading risk history...")
@@ -677,10 +674,14 @@ async def main():
             # Auto-resume check — lifts kill switch when drawdown recovers
             await check_auto_resume(portfolio, risk, notifier)
 
-            # Manage open positions (trailing stops, partial TPs, exits)
+            # Manage ACTIVE positions (trailing stops, partial TPs, exits)
             await manage_open_positions(
                 portfolio, risk, notifier, calibrator, bot_state, sr_engine
             )
+
+            # Manage SUB-MIN positions (wait for recovery above $10 then sell)
+            if portfolio.sub_min_positions:
+                await portfolio.manage_sub_min_positions(notifier)
 
             # Scheduled tasks (news, regime, rebalance, DCA, reports)
             await scheduled_tasks(
