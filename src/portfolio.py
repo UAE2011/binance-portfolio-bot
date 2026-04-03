@@ -207,7 +207,13 @@ class PortfolioManager:
 
     async def sync_with_exchange(self):
         balances = await self.exchange.get_balances()
-        self.cash_available = balances.get("USDT", {}).get("free", 0.0)
+        # Only update cash if balances returned real data.
+        # When exchange circuit breaker is OPEN, get_balances() returns {}
+        # which would set cash=0 and create a fake drawdown → false kill switch.
+        usdt_free = balances.get("USDT", {}).get("free")
+        if usdt_free is not None:
+            self.cash_available = float(usdt_free)
+        # else: keep last known cash_available (exchange temporarily unavailable)
         self.open_positions = self.db.get_open_trades()
 
         invested = 0.0
@@ -636,22 +642,27 @@ class PortfolioManager:
         return results
 
     async def liquidate_all(self, reason: str = "KILL_SWITCH") -> list:
+        """
+        Sequential liquidation with 0.5s delay between each position.
+        Avoids API burst that opens the exchange circuit breaker, which would
+        then block all subsequent sell orders and lock positions in DB forever.
+        """
+        import asyncio as _asyncio
         results = []
-        for trade in list(self.open_positions):
+        positions_copy = list(self.open_positions)
+        for trade in positions_copy:
             try:
                 price = await self.exchange.get_price(trade["symbol"])
-                r = await self.execute_exit(
-                    trade, trade.get("remaining_quantity", trade["quantity"]),
-                    reason, price,
-                )
-                if r:
-                    results.append(r)
+                if price and price > 0:
+                    r = await self.execute_exit(
+                        trade, trade.get("remaining_quantity", trade["quantity"]),
+                        reason, price,
+                    )
+                    if r:
+                        results.append(r)
+                    await _asyncio.sleep(0.5)  # pace the requests
             except Exception as e:
                 logger.error("Liquidation error for %s: %s", trade["symbol"], e)
-            try:
-                await self.exchange.cancel_all_orders(trade["symbol"])
-            except Exception:
-                pass
         return results
 
     async def _check_correlation(self, new_symbol: str) -> bool:

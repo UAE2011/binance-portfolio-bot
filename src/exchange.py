@@ -15,7 +15,7 @@ logger = setup_logging()
 
 
 class CircuitBreaker:
-    def __init__(self, failure_threshold: int = 5, recovery_timeout: int = 60):
+    def __init__(self, failure_threshold: int = 15, recovery_timeout: int = 30):
         self.failure_threshold = failure_threshold
         self.recovery_timeout = recovery_timeout
         self.failure_count = 0
@@ -134,8 +134,30 @@ class BinanceExchange:
                         backoff = min(backoff * 2, 60)
                     else:
                         body = await resp.text()
-                        logger.error("API error %d on %s: %s", resp.status, path, body)
-                        self.circuit_breaker.record_failure()
+                        # Parse Binance error code to decide if it's a real failure
+                        import json as _json
+                        try:
+                            err_data = _json.loads(body)
+                            binance_code = err_data.get("code", 0)
+                        except Exception:
+                            binance_code = 0
+
+                        # Benign client errors — log only, don't trip circuit breaker:
+                        # -2011: no orders to cancel  -1013: notional filter  -1121: invalid symbol
+                        # -2013: order not found      -1100: bad param        -1102: mandatory param
+                        benign_codes = {-2011, -1013, -1121, -2013, -1100, -1102, -2010}
+                        if binance_code in benign_codes:
+                            logger.warning("API client error %d on %s (code %d): ignored",
+                                           resp.status, path, binance_code)
+                            return {}
+                        elif binance_code == -1021:
+                            # Timestamp outside recvWindow — re-sync and retry
+                            logger.warning("Timestamp error on %s — re-syncing time", path)
+                            await self._sync_time()
+                            await asyncio.sleep(0.5)
+                        else:
+                            logger.error("API error %d on %s: %s", resp.status, path, body)
+                            self.circuit_breaker.record_failure()
                         if attempt < 3:
                             await asyncio.sleep(backoff)
                             backoff = min(backoff * 2, 30)

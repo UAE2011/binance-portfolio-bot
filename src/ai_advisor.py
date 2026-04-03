@@ -238,6 +238,12 @@ class AIAdvisor:
                 continue
 
         logger.error("AI call exhausted retries. Last error: %s", last_error)
+        # Auto-disable AI for this session if API key is invalid (401)
+        # Prevents log spam and unnecessary calls when credentials are wrong
+        if "401" in str(last_error) or "invalid_api_key" in str(last_error):
+            logger.warning("AI DISABLED for session — 401 invalid API key. "
+                           "Update GEMINI_API_KEY in .env on your server.")
+            self.cfg.ENABLED = False
         return None
 
     # ── Trade Analysis (STRONG model — critical decision) ────────────────

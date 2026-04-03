@@ -420,8 +420,18 @@ class RiskManager:
             return {"allowed": False, "reason": "Capital preservation mode — no new entries"}
 
         open_count = len(open_positions)
-        if open_count >= self.cfg.MAX_OPEN_POSITIONS:
-            return {"allowed": False, "reason": f"Max positions ({self.cfg.MAX_OPEN_POSITIONS}) reached"}
+        # Dynamic position limit based on portfolio size:
+        # Small account = fewer positions so each is adequately sized
+        if portfolio_value < 200:
+            max_pos = 3
+        elif portfolio_value < 500:
+            max_pos = 5
+        elif portfolio_value < 2000:
+            max_pos = 6
+        else:
+            max_pos = self.cfg.MAX_OPEN_POSITIONS
+        if open_count >= max_pos:
+            return {"allowed": False, "reason": f"Max positions ({max_pos}) reached for ${portfolio_value:.0f} account"}
 
         # Portfolio heat check
         if not self.portfolio_heat_ok(portfolio_value, open_positions):
