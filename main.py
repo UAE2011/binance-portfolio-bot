@@ -571,6 +571,11 @@ async def main():
     logger.info("Peak reset to $%.2f (cleared stale DB history)", portfolio.portfolio_value)
 
     logger.info("[4/6] Scanning spot wallet for existing positions...")
+    # First clean up ghost positions from previous sessions
+    ghosts_cleaned = await portfolio.clean_ghost_positions()
+    if ghosts_cleaned > 0:
+        await portfolio.sync_with_exchange()  # refresh after cleanup
+
     imported = await portfolio.import_spot_positions()
 
     if imported:

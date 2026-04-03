@@ -205,6 +205,101 @@ class PortfolioManager:
     # Portfolio Sync
     # ------------------------------------------------------------------
 
+
+    async def clean_ghost_positions(self) -> int:
+        """
+        On startup, cross-check DB open positions against actual wallet.
+        Marks positions as CLOSED_DUST if:
+          - Asset not in wallet at all
+          - Remaining quantity × current price < Binance min notional ($10)
+          - Quantity is effectively zero (<0.0001)
+
+        This prevents the bot from spamming sell errors every cycle for
+        positions that were closed/liquidated in a previous session but
+        left orphaned in the DB.
+        Returns number of ghost positions cleaned up.
+        """
+        from config.settings import Settings
+        logger.info("Checking for ghost/dust positions in DB...")
+
+        open_trades = self.db.get_open_trades()
+        if not open_trades:
+            return 0
+
+        # Get actual wallet balances
+        try:
+            balances = await self.exchange.get_balances()
+        except Exception as e:
+            logger.warning("Could not fetch balances for ghost check: %s", e)
+            return 0
+
+        cleaned = 0
+        for trade in open_trades:
+            symbol = trade["symbol"]
+            asset = symbol.replace("USDT", "").replace("BUSD", "")
+            remaining = trade.get("remaining_quantity", trade.get("quantity", 0))
+
+            # Check 1: Quantity is effectively zero
+            if remaining <= 0.0001:
+                self.db.update_trade(trade["id"], {
+                    "status": "CLOSED_DUST",
+                    "exit_reason": "GHOST: zero quantity in DB",
+                    "exit_time": utc_now(),
+                    "pnl": 0,
+                    "pnl_percent": 0,
+                })
+                logger.info("Ghost cleaned (zero qty): %s", symbol)
+                cleaned += 1
+                continue
+
+            # Check 2: Asset not in wallet at all
+            wallet_qty = balances.get(asset, {}).get("total", 0)
+            if wallet_qty <= 0:
+                self.db.update_trade(trade["id"], {
+                    "status": "CLOSED_DUST",
+                    "exit_reason": "GHOST: asset not in wallet",
+                    "exit_time": utc_now(),
+                    "pnl": 0,
+                    "pnl_percent": 0,
+                })
+                logger.info("Ghost cleaned (not in wallet): %s", symbol)
+                cleaned += 1
+                continue
+
+            # Check 3: Value below Binance notional minimum ($10)
+            try:
+                price = await self.exchange.get_price(symbol)
+                min_notional = self.exchange.get_min_notional(symbol)
+                value = min(remaining, wallet_qty) * price
+                if value < min_notional or value < 10.0:
+                    self.db.update_trade(trade["id"], {
+                        "status": "CLOSED_DUST",
+                        "exit_reason": f"GHOST: value ${value:.2f} below minimum",
+                        "exit_time": utc_now(),
+                        "pnl": 0,
+                        "pnl_percent": 0,
+                    })
+                    logger.info("Ghost cleaned (dust value $%.2f): %s", value, symbol)
+                    cleaned += 1
+                    continue
+
+                # Position is real — update remaining_quantity to match wallet
+                if abs(wallet_qty - remaining) / remaining > 0.05:
+                    self.db.update_trade(trade["id"], {
+                        "remaining_quantity": min(wallet_qty, remaining),
+                    })
+                    logger.info("Synced quantity for %s: DB=%.6f wallet=%.6f",
+                                symbol, remaining, wallet_qty)
+            except Exception as e:
+                logger.debug("Ghost check price error %s: %s", symbol, e)
+
+        if cleaned > 0:
+            logger.info("Ghost cleanup: %d positions marked CLOSED_DUST", cleaned)
+            # Refresh open positions list
+            self.open_positions = self.db.get_open_trades()
+
+        return cleaned
+
     async def sync_with_exchange(self):
         balances = await self.exchange.get_balances()
         # Only update cash if balances returned real data.
