@@ -28,33 +28,41 @@ class TelegramConfig:
 
 
 class AIConfig:
-    """Dual-model AI routing via Groq (FREE, no credit card required).
+    """Dual-model AI routing via Google Gemini (FREE, generous limits).
 
-    Groq free tier (April 2026):
-    - llama-3.3-70b-versatile: 30 RPM, 14,400 RPD, 6000 tokens/min — strong reasoning
-    - llama-3.1-8b-instant: 30 RPM, 14,400 RPD, 6000 tokens/min — ultra-fast
+    Google AI Studio free tier (April 2026):
+    - gemini-2.5-flash-preview-04-17: 1M+ tokens/day, 15 RPM — best reasoning, FREE
+    - gemini-2.0-flash: 1M tokens/day, 15 RPM — ultra-fast, FREE
+    - Both models use OpenAI-compatible API via Google's endpoint
+
+    Get free API key at: https://aistudio.google.com/apikey (no credit card)
 
     Routing logic:
     - FAST model (90% of calls): news sentiment, quick confirmations, data extraction
-    - STRONG model (10% of calls): trade entry/exit decisions, portfolio rebalancing, regime analysis
+    - STRONG model (10% of calls): trade entry/exit decisions, portfolio rebalancing
 
-    Both models are 100% FREE via Groq's OpenAI-compatible API.
+    Fallback chain: Gemini 2.5 Flash → Gemini 2.0 Flash → Groq llama-3.3-70b
     """
     ENABLED: bool = os.getenv("AI_TRADING_ENABLED", "true").lower() == "true"
-    # Groq API configuration
-    API_KEY: str = os.getenv("GROQ_API_KEY", "")
-    BASE_URL: str = os.getenv("AI_BASE_URL", "https://api.groq.com/openai/v1")
-    # Dual-model routing (Groq free models)
-    FAST_MODEL: str = os.getenv("AI_FAST_MODEL", "llama-3.1-8b-instant")
-    STRONG_MODEL: str = os.getenv("AI_STRONG_MODEL", "llama-3.3-70b-versatile")
-    # Legacy single-model fallback
-    MODEL: str = os.getenv("AI_MODEL", "llama-3.3-70b-versatile")
-    MIN_CONFIDENCE: float = float(os.getenv("AI_MIN_CONFIDENCE", "0.65"))
+    # Google Gemini via OpenAI-compatible endpoint (primary — free, 1M+ tokens/day)
+    API_KEY: str = os.getenv("GEMINI_API_KEY", os.getenv("GROQ_API_KEY", ""))
+    BASE_URL: str = os.getenv(
+        "AI_BASE_URL",
+        "https://generativelanguage.googleapis.com/v1beta/openai/"
+    )
+    # Dual-model routing
+    FAST_MODEL: str = os.getenv("AI_FAST_MODEL", "gemini-2.0-flash")
+    STRONG_MODEL: str = os.getenv("AI_STRONG_MODEL", "gemini-2.5-flash-preview-04-17")
+    MODEL: str = os.getenv("AI_MODEL", "gemini-2.5-flash-preview-04-17")
+    MIN_CONFIDENCE: float = float(os.getenv("AI_MIN_CONFIDENCE", "0.60"))
     ANALYSIS_TIMEOUT: int = int(os.getenv("AI_ANALYSIS_TIMEOUT", "30"))
     MAX_DAILY_CALLS: int = int(os.getenv("AI_MAX_DAILY_CALLS", "500"))
     VETO_POWER: bool = os.getenv("AI_VETO_POWER", "true").lower() == "true"
-    # Cost tracking (Groq is free, but keep for future paid providers)
+    # Min confidence for veto to apply — low-confidence SKIPs should abstain, not block
+    VETO_MIN_CONFIDENCE: float = float(os.getenv("AI_VETO_MIN_CONFIDENCE", "0.60"))
     DAILY_COST_LIMIT_USD: float = float(os.getenv("AI_DAILY_COST_LIMIT", "0.00"))
+    # Max AI calls per trading cycle (prevents token exhaustion on 41-signal cycles)
+    MAX_CALLS_PER_CYCLE: int = int(os.getenv("AI_MAX_CALLS_PER_CYCLE", "5"))
 
 
 class RiskConfig:

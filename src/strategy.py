@@ -498,17 +498,23 @@ class SignalGenerator:
         self.regime = regime_detector
         self.news = news_intel
         self.ai = ai_advisor
+        self._cycle_ai_calls: int = 0  # reset each cycle
+        self._cycle_id: int = 0         # tracks which cycle we're in
 
     async def evaluate(self, symbol: str, indicators_entry: dict,
                        indicators_primary: dict, indicators_trend: dict,
                        kline_history: list,
-                       portfolio_context: dict = None) -> Optional[dict]:
+                       portfolio_context: dict = None,
+                       cycle_id: int = 0) -> Optional[dict]:
         """Streamlined evaluation: score everything, no gates, just threshold."""
+        # Reset per-cycle AI call counter when cycle changes
+        if cycle_id != self._cycle_id:
+            self._cycle_ai_calls = 0
+            self._cycle_id = cycle_id
+
         regime_params = self.regime.get_regime_params()
 
-        # NO GATES — every asset gets scored regardless of regime, sentiment, etc.
-
-        # Score the setup
+        # Score the setup (no gates — every asset gets scored)
         result = self.scorer.score(
             symbol, indicators_entry, indicators_primary, indicators_trend,
             kline_history, regime_params,
@@ -543,9 +549,11 @@ class SignalGenerator:
             "resistance_levels": self.scorer.sr.get_resistance_prices(symbol),
         }
 
-        # AI analysis — ADVISORY ONLY, never blocks
-        if self.ai and Settings.ai.ENABLED:
+        # AI analysis — only for top candidates per cycle to preserve token budget
+        max_ai_per_cycle = Settings.ai.MAX_CALLS_PER_CYCLE
+        if self.ai and Settings.ai.ENABLED and self._cycle_ai_calls < max_ai_per_cycle:
             try:
+                self._cycle_ai_calls += 1
                 recent_news = self.news.get_top_headlines(5)
                 ai_result = await self.ai.analyze_trade(
                     symbol=symbol,
@@ -559,17 +567,33 @@ class SignalGenerator:
                     portfolio_context=portfolio_context or {},
                 )
                 signal["ai_analysis"] = ai_result
-                # Enforce veto power if configured
+
+                # Enforce veto power — but only when AI confidence is high enough.
+                # A low-confidence SKIP (< VETO_MIN_CONFIDENCE) should abstain, not block.
                 approval = self.ai.should_approve_entry(ai_result, result["total_score"])
                 signal["ai_approval"] = approval
 
-                if Settings.ai.VETO_POWER and not approval.get("approved", True):
+                ai_confidence = ai_result.get("confidence", 0) if ai_result else 0
+                veto_threshold = Settings.ai.VETO_MIN_CONFIDENCE
+
+                if (Settings.ai.VETO_POWER
+                        and not approval.get("approved", True)
+                        and ai_confidence >= veto_threshold):
                     logger.info(
-                        "AI vetoed %s (confidence=%.0f%%): %s",
-                        symbol, ai_result.get("confidence", 0) * 100,
+                        "AI vetoed %s (confidence=%.0f%% ≥ %.0f%% threshold): %s",
+                        symbol, ai_confidence * 100, veto_threshold * 100,
                         approval.get("reason", "")[:80],
                     )
                     return None
+                elif (Settings.ai.VETO_POWER
+                      and not approval.get("approved", True)
+                      and ai_confidence < veto_threshold):
+                    logger.info(
+                        "AI says SKIP for %s but confidence %.0f%% < %.0f%% threshold — "
+                        "proceeding on confluence (%d/100)",
+                        symbol, ai_confidence * 100, veto_threshold * 100,
+                        result["total_score"],
+                    )
 
                 # AI can suggest tighter SL/TP
                 if approval.get("ai_sl"):
@@ -583,5 +607,12 @@ class SignalGenerator:
                 logger.warning("AI analysis failed for %s (non-blocking): %s", symbol, e)
                 signal["ai_analysis"] = None
                 signal["ai_approval"] = {"approved": True, "reason": "AI unavailable"}
+        elif self._cycle_ai_calls >= max_ai_per_cycle:
+            # AI budget exhausted for this cycle — proceed on confluence score alone
+            signal["ai_analysis"] = None
+            signal["ai_approval"] = {
+                "approved": True,
+                "reason": f"AI budget ({max_ai_per_cycle} calls/cycle) exhausted — confluence only",
+            }
 
         return signal

@@ -429,6 +429,7 @@ class TradingBot:
             signal = await self.signal_gen.evaluate(
                 symbol, ind_entry, ind_primary, ind_trend, history_primary,
                 portfolio_context,
+                cycle_id=self._cycle_count,
             )
 
             if signal:
