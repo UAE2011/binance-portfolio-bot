@@ -1,12 +1,24 @@
 """
-Strategy Module — SCALPING MODE (1m / 5m / 15m).
+Strategy — Playbook-optimized confluence scoring for Binance spot.
 
-Ultra-fast signal generation for short-term opportunities.
-Minimal gates, low threshold (35/100), rapid entries.
-Designed to capture 0.3-1.5% moves multiple times per day.
+Scoring model (100 pts total):
+  Technical    40 pts  RSI momentum, MACD, EMA alignment, SuperTrend, BB
+  Momentum     20 pts  Price acceleration, candle patterns, StochRSI
+  Volume       15 pts  Volume confirmation (50-100%+ above SMA for breakouts)
+  Structure    10 pts  S/R proximity, trend strength (ADX)
+  Regime        5 pts  Adaptive soft bonus
+  Sentiment     5 pts  Fear & Greed, news
+  Timing        5 pts  Peak-hour bonus (14:30-16:30 UTC, Tue-Thu)
+
+Key changes from playbook:
+  - RSI momentum mode (>50 = bullish, not just oversold)
+  - SuperTrend confirmation required for trend-following entries
+  - Volume must be ≥1.5× SMA for breakout entries
+  - ADX >25 confirms trending regime (avoids choppy entries)
+  - Time-of-day weighting (London/NY overlap = peak liquidity)
 """
-
 import json
+from datetime import datetime, timezone
 from typing import Optional
 
 from config.settings import Settings
@@ -21,8 +33,6 @@ logger = setup_logging()
 # ---------------------------------------------------------------------------
 
 class SupportResistanceEngine:
-    """Detects and tracks support/resistance levels from price history."""
-
     def __init__(self):
         self.levels_cache: dict = {}
 
@@ -34,19 +44,16 @@ class SupportResistanceEngine:
             return {"support": [], "resistance": []}
 
         swings = detect_swing_points(closes, lookback=3)
-        swing_highs = swings["swing_highs"]
-        swing_lows = swings["swing_lows"]
+        wick_h = detect_swing_points(highs, lookback=3)
+        wick_l = detect_swing_points(lows, lookback=3)
 
-        wick_swings_h = detect_swing_points(highs, lookback=3)
-        wick_swings_l = detect_swing_points(lows, lookback=3)
-        swing_highs += wick_swings_h["swing_highs"]
-        swing_lows += wick_swings_l["swing_lows"]
+        all_highs = swings["swing_highs"] + wick_h["swing_highs"]
+        all_lows = swings["swing_lows"] + wick_l["swing_lows"]
 
-        resistance_zones = cluster_levels(swing_highs, threshold_pct=0.003)
-        support_zones = cluster_levels(swing_lows, threshold_pct=0.003)
+        resistance_zones = cluster_levels(all_highs, threshold_pct=0.003)
+        support_zones = cluster_levels(all_lows, threshold_pct=0.003)
 
         current_price = closes[-1]
-
         support = sorted(
             [z for z in support_zones if z["level"] < current_price],
             key=lambda x: x["level"], reverse=True,
@@ -56,23 +63,18 @@ class SupportResistanceEngine:
             key=lambda x: x["level"],
         )
 
-        result = {
-            "support": support[:10],
-            "resistance": resistance[:10],
-        }
+        result = {"support": support[:10], "resistance": resistance[:10]}
         self.levels_cache[symbol] = result
         return result
 
     def get_nearest_support(self, symbol: str, current_price: float) -> Optional[dict]:
-        levels = self.levels_cache.get(symbol, {}).get("support", [])
-        for level in levels:
+        for level in self.levels_cache.get(symbol, {}).get("support", []):
             if level["level"] < current_price:
                 return level
         return None
 
     def get_nearest_resistance(self, symbol: str, current_price: float) -> Optional[dict]:
-        levels = self.levels_cache.get(symbol, {}).get("resistance", [])
-        for level in levels:
+        for level in self.levels_cache.get(symbol, {}).get("resistance", []):
             if level["level"] > current_price:
                 return level
         return None
@@ -97,7 +99,16 @@ class SupportResistanceEngine:
         if nearest is None:
             return False
         distance_pct = abs(current_price - nearest["level"]) / nearest["level"]
-        return distance_pct <= 0.015  # 1.5% proximity for scalping
+        return distance_pct <= Settings.strategy.SR_PROXIMITY_PCT
+
+    def risk_reward_ratio(self, symbol: str, entry: float, stop: float) -> float:
+        """Calculate R:R to nearest resistance."""
+        resistance = self.get_nearest_resistance(symbol, entry)
+        if resistance is None or stop >= entry:
+            return 0.0
+        reward = resistance["level"] - entry
+        risk = entry - stop
+        return reward / risk if risk > 0 else 0.0
 
     def get_support_prices(self, symbol: str) -> list:
         return [z["level"] for z in self.levels_cache.get(symbol, {}).get("support", [])]
@@ -111,21 +122,22 @@ class SupportResistanceEngine:
 # ---------------------------------------------------------------------------
 
 class VolumeSpikeDetector:
-    """Detects volume spikes that confirm breakouts or signal reversals."""
-
     @staticmethod
     def detect_spike(volume: float, volume_sma: float) -> dict:
         if volume_sma <= 0:
-            return {"is_spike": False, "ratio": 0}
+            return {"is_spike": False, "ratio": 0, "strength": "NONE"}
         ratio = volume / volume_sma
-        multiplier = Settings.strategy.VOLUME_SPIKE_MULTIPLIER
+        threshold = Settings.strategy.VOLUME_SPIKE_MULTIPLIER
+        breakout_threshold = Settings.strategy.VOLUME_BREAKOUT_MULTIPLIER
         return {
-            "is_spike": ratio >= multiplier,
+            "is_spike": ratio >= threshold,
+            "is_breakout_vol": ratio >= breakout_threshold,
             "ratio": ratio,
             "strength": (
                 "EXTREME" if ratio >= 4.0
                 else "STRONG" if ratio >= 3.0
-                else "MODERATE" if ratio >= multiplier
+                else "BREAKOUT" if ratio >= breakout_threshold
+                else "MODERATE" if ratio >= threshold
                 else "NORMAL"
             ),
         }
@@ -147,21 +159,18 @@ class VolumeSpikeDetector:
 
 
 # ---------------------------------------------------------------------------
-# Confluence Scorer — SCALPING MODE
+# Confluence Scorer — Playbook-based 100-point system
 # ---------------------------------------------------------------------------
 
 class ConfluenceScorer:
     """
-    100-point confluence scoring — SCALPING mode.
-
-    Scoring breakdown:
-    - Technical (50 pts): RSI, MACD, EMA, Bollinger, S/R, entry TF
-    - Momentum (20 pts): Price action, candle patterns, micro-trend
-    - Volume (15 pts): Volume confirmation with generous scoring
-    - Regime (10 pts): Soft bonus, never blocks
-    - Sentiment (5 pts): Minimal weight — technicals dominate
-
-    Threshold: 35/100 (ultra-low for maximum opportunity capture)
+    Playbook-optimized scoring:
+    - RSI momentum mode (>50 = bullish, not oversold reversal)
+    - SuperTrend confirms trend direction
+    - MACD crypto-tuned (8,17,9)
+    - Volume filter: breakouts need ≥2× SMA confirmation
+    - ADX trend strength as gate for trend-following
+    - Time-of-day bonus (peak liquidity hours)
     """
 
     def __init__(self, regime_detector, news_intel, database, sr_engine: SupportResistanceEngine):
@@ -176,35 +185,48 @@ class ConfluenceScorer:
         breakdown = {}
         total = 0
 
-        # 1. Technical Score (50 points)
+        # 1. Technical Score (40 pts)
         tech_score, tech_detail = self._technical_score(
-            symbol, indicators_primary, indicators_entry, indicators_trend, kline_history,
+            symbol, indicators_primary, indicators_entry, indicators_trend
         )
-        breakdown["technical"] = {"score": tech_score, "max": 50, "details": tech_detail}
+        breakdown["technical"] = {"score": tech_score, "max": 40, "details": tech_detail}
         total += tech_score
 
-        # 2. Momentum Score (20 points) — NEW: price action micro-patterns
-        mom_score, mom_detail = self._momentum_score(indicators_entry, indicators_primary, kline_history)
+        # 2. Momentum Score (20 pts)
+        mom_score, mom_detail = self._momentum_score(
+            indicators_entry, indicators_primary, kline_history
+        )
         breakdown["momentum"] = {"score": mom_score, "max": 20, "details": mom_detail}
         total += mom_score
 
-        # 3. Volume Score (15 points)
-        volume_score, vol_detail = self._volume_score(indicators_primary)
-        breakdown["volume"] = {"score": volume_score, "max": 15, "details": vol_detail}
-        total += volume_score
+        # 3. Volume Score (15 pts)
+        vol_score, vol_detail = self._volume_score(indicators_primary)
+        breakdown["volume"] = {"score": vol_score, "max": 15, "details": vol_detail}
+        total += vol_score
 
-        # 4. Regime Score (10 points) — soft bonus
+        # 4. Structure Score (10 pts) — S/R + ADX
+        struct_score, struct_detail = self._structure_score(symbol, indicators_primary)
+        breakdown["structure"] = {"score": struct_score, "max": 10, "details": struct_detail}
+        total += struct_score
+
+        # 5. Regime Score (5 pts) — soft bonus
         regime_score = self._regime_score()
-        breakdown["regime"] = {"score": regime_score, "max": 10}
+        breakdown["regime"] = {"score": regime_score, "max": 5}
         total += regime_score
 
-        # 5. Sentiment Score (5 points) — minimal weight
+        # 6. Sentiment Score (5 pts)
         sentiment_score = self._sentiment_score()
         breakdown["sentiment"] = {"score": sentiment_score, "max": 5}
         total += sentiment_score
 
-        threshold = regime_params.get("confluence_threshold",
-                                       Settings.strategy.CONFLUENCE_SCORE_THRESHOLD)
+        # 7. Timing Score (5 pts) — peak hours bonus
+        timing_score = self._timing_score()
+        breakdown["timing"] = {"score": timing_score, "max": 5}
+        total += timing_score
+
+        threshold = regime_params.get(
+            "confluence_threshold", Settings.strategy.CONFLUENCE_SCORE_THRESHOLD
+        )
 
         self.db.save_signal({
             "timestamp": utc_now(),
@@ -223,204 +245,196 @@ class ConfluenceScorer:
             "passes": total >= threshold,
         }
 
-    def _technical_score(self, symbol: str, ind_primary: dict, ind_entry: dict,
-                         ind_trend: dict, history: list) -> tuple:
+    def _technical_score(self, symbol: str, ind: dict, ind_entry: dict,
+                         ind_trend: dict) -> tuple:
         score = 0
         details = {}
-        price = ind_primary.get("close", 0)
+        price = ind.get("close", 0)
 
-        # --- RSI (12 pts) — fast RSI, wider acceptable range ---
-        rsi = ind_primary.get("rsi", 50)
-        if 20 <= rsi <= 40:
+        # --- RSI Momentum Mode (12 pts) ---
+        # Research: RSI >50 = bullish momentum beats oversold reversal in crypto
+        rsi = ind.get("rsi", 50)
+        rsi_fast = ind.get("rsi_fast", 50)
+
+        if rsi > 55 and rsi < 72:
             rsi_score = 12
-            details["rsi"] = f"RSI={rsi:.1f} (oversold — strong buy)"
-        elif 40 < rsi <= 55:
+            details["rsi"] = f"RSI={rsi:.1f} (strong momentum zone)"
+        elif rsi > 50 and rsi <= 55:
             rsi_score = 10
-            details["rsi"] = f"RSI={rsi:.1f} (momentum zone)"
-        elif 55 < rsi <= 65:
+            details["rsi"] = f"RSI={rsi:.1f} (momentum building)"
+        elif rsi >= 30 and rsi <= 50:
             rsi_score = 7
-            details["rsi"] = f"RSI={rsi:.1f} (strong momentum)"
-        elif 65 < rsi <= 75:
-            rsi_score = 4
-            details["rsi"] = f"RSI={rsi:.1f} (hot but tradeable)"
-        elif rsi < 20:
-            rsi_score = 8
-            details["rsi"] = f"RSI={rsi:.1f} (extreme oversold — risky bounce)"
+            details["rsi"] = f"RSI={rsi:.1f} (recovery zone)"
+        elif rsi < 30:
+            rsi_score = 8  # oversold bounce potential
+            details["rsi"] = f"RSI={rsi:.1f} (oversold — bounce setup)"
         else:
-            rsi_score = 2
-            details["rsi"] = f"RSI={rsi:.1f} (overbought — small position only)"
+            rsi_score = 3
+            details["rsi"] = f"RSI={rsi:.1f} (overbought)"
         score += rsi_score
 
-        # --- MACD (12 pts) — fast MACD (5,13,4) ---
-        macd_hist = ind_primary.get("macd_histogram", 0)
-        macd_line = ind_primary.get("macd", 0)
-        macd_signal = ind_primary.get("macd_signal", 0)
+        # Fast RSI entry confirmation
+        if rsi_fast > 50 and rsi_fast < 75:
+            score += 2
+            details["rsi_fast"] = f"Fast RSI={rsi_fast:.0f} confirms entry"
+        elif rsi_fast > 75:
+            score -= 1
+            details["rsi_fast"] = f"Fast RSI={rsi_fast:.0f} extended"
+
+        # --- MACD (10 pts) --- crypto-tuned 8,17,9
+        macd_hist = ind.get("macd_histogram", 0)
+        macd_line = ind.get("macd", 0)
+        macd_signal = ind.get("macd_signal", 0)
+        prev_hist = ind.get("prev_macd_histogram", macd_hist - 0.0001)
+
         if macd_line > macd_signal and macd_hist > 0:
-            macd_score = 12
+            macd_score = 10
             details["macd"] = "MACD bullish crossover + positive histogram"
         elif macd_hist > 0:
-            macd_score = 9
-            details["macd"] = "MACD histogram positive"
+            macd_score = 8
+            details["macd"] = "MACD histogram positive (bullish)"
         elif macd_line > macd_signal:
-            macd_score = 7
+            macd_score = 6
             details["macd"] = "MACD above signal (early bullish)"
-        elif macd_hist > ind_primary.get("prev_macd_histogram", macd_hist - 0.0001):
+        elif macd_hist > prev_hist:
             macd_score = 5
-            details["macd"] = "MACD improving (turning bullish)"
+            details["macd"] = "MACD improving — turning bullish"
         else:
             macd_score = 2
-            details["macd"] = "MACD bearish (small base points)"
+            details["macd"] = "MACD bearish"
         score += macd_score
 
-        # --- EMA alignment (8 pts) ---
-        ema_score = 0
-        ema9 = ind_primary.get("ema9", 0)
-        ema21 = ind_primary.get("ema21", 0)
-
-        if price > ema9 > ema21 and ema9 > 0:
-            ema_score = 8
-            details["ema"] = "Price > EMA9 > EMA21 (perfect alignment)"
-        elif price > ema21 and ema21 > 0:
-            ema_score = 6
-            details["ema"] = "Price above EMA21 (trend intact)"
-        elif price > ema9 and ema9 > 0:
-            ema_score = 5
-            details["ema"] = "Price above EMA9 (short-term bullish)"
-        elif ema9 > 0 and abs(price - ema9) / ema9 < 0.003:
-            ema_score = 4
-            details["ema"] = "Price at EMA9 (potential bounce)"
+        # --- SuperTrend (8 pts) — research-backed best trailing indicator ---
+        st_up = ind.get("supertrend_up", False)
+        st_val = ind.get("supertrend", 0)
+        if st_up:
+            score += 8
+            details["supertrend"] = f"SuperTrend BULLISH (price above ${st_val:.4f})"
         else:
-            ema_score = 2
-            details["ema"] = "Below EMAs (base points)"
+            score += 2  # base points even bearish
+            details["supertrend"] = f"SuperTrend BEARISH (price below ${st_val:.4f})"
+
+        # --- EMA Alignment (6 pts) — 9/21/55 stack ---
+        ema9 = ind.get("ema9", 0)
+        ema21 = ind.get("ema21", 0)
+        ema55 = ind.get("ema55", ema21)
+        sma200 = ind.get("sma200", 0)
+
+        if price > ema9 > ema21 > ema55:
+            ema_score = 6
+            details["ema"] = "Perfect EMA alignment (9>21>55)"
+        elif price > ema9 > ema21:
+            ema_score = 5
+            details["ema"] = "Price > EMA9 > EMA21"
+        elif price > ema21:
+            ema_score = 4
+            details["ema"] = "Price above EMA21"
+        elif ema9 > 0 and abs(price - ema9) / ema9 < 0.005:
+            ema_score = 3
+            details["ema"] = "Price testing EMA9 (potential bounce)"
+        else:
+            ema_score = 1
+            details["ema"] = "Below key EMAs"
+        # Bonus: price above 200 SMA
+        if sma200 > 0 and price > sma200:
+            ema_score = min(ema_score + 1, 6)
+            details["sma200"] = "Above 200 SMA ✓"
         score += ema_score
 
-        # --- Bollinger Bands (8 pts) ---
-        bb_lower = ind_primary.get("bb_lower", 0)
-        bb_upper = ind_primary.get("bb_upper", 0)
-        bb_mid = ind_primary.get("bb_middle", 0)
-        bb_score = 0
-        if bb_lower > 0 and price <= bb_lower * 1.002:
-            bb_score = 8
-            details["bollinger"] = "AT lower Bollinger band (bounce!)"
-        elif bb_lower > 0 and price <= bb_lower * 1.01:
-            bb_score = 6
-            details["bollinger"] = "Near lower Bollinger band"
-        elif bb_mid > 0 and price < bb_mid:
-            bb_score = 4
-            details["bollinger"] = "Below BB midline (room to run)"
-        elif bb_upper > 0 and price < bb_upper:
-            bb_score = 2
-            details["bollinger"] = "Between mid and upper BB"
-        else:
-            bb_score = 1
-            details["bollinger"] = "Above upper BB"
-        score += bb_score
+        # --- Bollinger Bands (4 pts) — wider 2.5σ for crypto ---
+        bb_lower = ind.get("bb_lower", 0)
+        bb_upper = ind.get("bb_upper", 0)
+        bb_mid = ind.get("bb_middle", 0)
+        bb_pct_b = ind.get("bb_percent_b", 0.5)
 
-        # --- S/R proximity (5 pts) ---
-        sr_score = 0
-        if self.sr.is_near_support(symbol, price):
-            nearest = self.sr.get_nearest_support(symbol, price)
-            if nearest:
-                sr_score = 5
-                details["sr"] = f"Near support ${nearest['level']:.4f}"
+        if bb_lower > 0 and price <= bb_lower * 1.005:
+            score += 4
+            details["bb"] = "At lower BB (bounce setup)"
+        elif bb_pct_b < 0.3:
+            score += 3
+            details["bb"] = f"Lower BB zone (B%={bb_pct_b:.2f})"
+        elif bb_pct_b < 0.5:
+            score += 2
+            details["bb"] = f"Below BB midline (room to run)"
         else:
-            res = self.sr.get_nearest_resistance(symbol, price)
-            if res:
-                dist = (res["level"] - price) / price if price > 0 else 1
-                if dist > 0.02:
-                    sr_score = 3
-                    details["sr"] = f"Room to resistance ({dist:.1%})"
-                else:
-                    sr_score = 1
-                    details["sr"] = "Close to resistance"
-            else:
-                sr_score = 2
-                details["sr"] = "No clear S/R (neutral)"
-        score += sr_score
+            score += 1
+            details["bb"] = f"BB neutral (B%={bb_pct_b:.2f})"
 
-        # --- Entry timeframe confirmation (5 pts) ---
-        entry_rsi = ind_entry.get("rsi", 50)
-        entry_close = ind_entry.get("close", 0)
-        entry_ema9 = ind_entry.get("ema9", 0)
-        entry_bonus = 0
-        if entry_close > entry_ema9 and entry_ema9 > 0:
-            entry_bonus += 3
-            details["entry_tf"] = "Entry TF price > EMA9"
-        else:
-            entry_bonus += 1
-            details["entry_tf"] = "Entry TF neutral"
-        if 25 <= entry_rsi <= 60:
-            entry_bonus += 2
-            details["entry_rsi"] = f"Entry RSI={entry_rsi:.0f} (good)"
-        else:
-            entry_bonus += 1
-            details["entry_rsi"] = f"Entry RSI={entry_rsi:.0f}"
-        score += min(entry_bonus, 5)
+        # --- Trend timeframe confirmation (bonus) ---
+        trend_rsi = ind_trend.get("rsi", 50)
+        trend_ema21 = ind_trend.get("ema21", 0)
+        trend_price = ind_trend.get("close", price)
+        if trend_price > trend_ema21 > 0 and trend_rsi > 50:
+            score += 3
+            details["trend_tf"] = "4H bullish trend confirmed"
+        elif trend_price > trend_ema21 > 0:
+            score += 1
+            details["trend_tf"] = "4H above EMA21"
 
-        return min(score, 50), details
+        return min(score, 40), details
 
     def _momentum_score(self, ind_entry: dict, ind_primary: dict, history: list) -> tuple:
-        """NEW: Price action and micro-momentum scoring for scalping."""
         score = 0
         details = {}
 
-        # --- Green candle streak (6 pts) ---
-        if history and len(history) >= 3:
-            green_count = 0
-            for k in history[-5:]:
-                if k.get("close", 0) > k.get("open", 0):
-                    green_count += 1
-            if green_count >= 4:
-                score += 6
-                details["candles"] = f"{green_count}/5 green candles (strong momentum)"
-            elif green_count >= 3:
-                score += 4
-                details["candles"] = f"{green_count}/5 green candles (building)"
-            elif green_count >= 2:
-                score += 2
-                details["candles"] = f"{green_count}/5 green candles"
-            else:
-                score += 1
-                details["candles"] = f"{green_count}/5 green candles (base)"
-
-        # --- Price acceleration (7 pts) ---
+        # --- Price acceleration (8 pts) ---
         if history and len(history) >= 10:
             closes = [k["close"] for k in history]
-            recent_5 = closes[-5:]
-            prior_5 = closes[-10:-5]
-            recent_change = (recent_5[-1] - recent_5[0]) / recent_5[0] if recent_5[0] > 0 else 0
-            prior_change = (prior_5[-1] - prior_5[0]) / prior_5[0] if prior_5[0] > 0 else 0
-
-            if recent_change > 0 and recent_change > prior_change:
-                score += 7
-                details["acceleration"] = f"Price accelerating +{recent_change:.2%}"
+            recent_change = (closes[-1] - closes[-5]) / closes[-5] if closes[-5] > 0 else 0
+            prior_change = (closes[-5] - closes[-10]) / closes[-10] if closes[-10] > 0 else 0
+            if recent_change > 0.02 and recent_change > prior_change:
+                score += 8
+                details["acceleration"] = f"Strong acceleration +{recent_change:.2%}"
+            elif recent_change > 0 and recent_change > prior_change:
+                score += 6
+                details["acceleration"] = f"Accelerating +{recent_change:.2%}"
             elif recent_change > 0:
-                score += 5
-                details["acceleration"] = f"Price rising +{recent_change:.2%}"
-            elif recent_change > -0.005:
-                score += 3
-                details["acceleration"] = "Price stable (potential breakout)"
+                score += 4
+                details["acceleration"] = f"Rising +{recent_change:.2%}"
+            elif recent_change > -0.01:
+                score += 2
+                details["acceleration"] = "Consolidating (potential breakout)"
             else:
                 score += 1
-                details["acceleration"] = f"Price declining {recent_change:.2%} (base)"
+                details["acceleration"] = f"Declining {recent_change:.2%}"
 
-        # --- StochRSI oversold bounce (4 pts) ---
+        # --- Green candle streak (5 pts) ---
+        if history and len(history) >= 5:
+            recent_5 = history[-5:]
+            green = sum(1 for k in recent_5 if k.get("close", 0) > k.get("open", 0))
+            if green >= 4:
+                score += 5
+                details["candles"] = f"{green}/5 green candles (strong)"
+            elif green >= 3:
+                score += 3
+                details["candles"] = f"{green}/5 green candles"
+            elif green >= 2:
+                score += 2
+                details["candles"] = f"{green}/5 green candles"
+            else:
+                score += 1
+                details["candles"] = f"{green}/5 green candles"
+
+        # --- StochRSI (5 pts) ---
         stoch_k = ind_primary.get("stoch_k", 50)
         stoch_d = ind_primary.get("stoch_d", 50)
-        if stoch_k < 25:
+        if stoch_k < 20:
+            score += 5
+            details["stochrsi"] = f"StochRSI K={stoch_k:.0f} (deep oversold)"
+        elif stoch_k < 35 and stoch_k > stoch_d:
             score += 4
-            details["stochrsi"] = f"StochRSI K={stoch_k:.0f} (oversold — bounce setup)"
-        elif stoch_k < 40 and stoch_k > stoch_d:
+            details["stochrsi"] = f"StochRSI K={stoch_k:.0f} crossing up from oversold"
+        elif stoch_k < 50:
             score += 3
-            details["stochrsi"] = f"StochRSI K={stoch_k:.0f} crossing up"
-        elif stoch_k < 60:
+            details["stochrsi"] = f"StochRSI K={stoch_k:.0f} (neutral-low)"
+        elif stoch_k < 65:
             score += 2
             details["stochrsi"] = f"StochRSI K={stoch_k:.0f} (neutral)"
         else:
             score += 1
-            details["stochrsi"] = f"StochRSI K={stoch_k:.0f}"
+            details["stochrsi"] = f"StochRSI K={stoch_k:.0f} (high)"
 
-        # --- RSI divergence bonus (3 pts) ---
+        # --- RSI divergence bonus (2 pts) ---
         if history and len(history) >= 20:
             try:
                 closes = [k["close"] for k in history]
@@ -431,66 +445,145 @@ class ConfluenceScorer:
                     rsi_calc.update(k["close"])
                     rsi_values.append(rsi_calc.value)
                 if detect_rsi_divergence(closes, rsi_values):
-                    score += 3
-                    details["divergence"] = "Bullish RSI divergence (+3)"
+                    score += 2
+                    details["divergence"] = "Bullish RSI divergence detected (+2)"
             except Exception:
                 pass
 
         return min(score, 20), details
 
-    def _regime_score(self) -> int:
-        """Soft bonus — never blocks. Even BEAR gets base points."""
-        regime_map = {
-            "BULL": 10,
-            "SIDEWAYS": 8,
-            "HIGH_VOLATILITY": 6,
-            "BEAR": 4,
-        }
-        return regime_map.get(self.regime.current_regime, 5)
-
-    def _sentiment_score(self) -> int:
-        """Minimal weight — technicals dominate in scalping."""
-        raw = self.news.get_sentiment_points()
-        # Scale from 0-15 range down to 0-5, minimum 2 base points
-        scaled = min(int(raw * 5 / 15), 5)
-        return max(scaled, 2)
-
     def _volume_score(self, ind: dict) -> tuple:
-        """Generous scoring — give base points even without spike."""
+        """Volume must confirm breakouts — playbook requires 50-100%+ above SMA."""
         volume = ind.get("volume", 0)
         vol_sma = ind.get("volume_sma", 1)
-        spike = VolumeSpikeDetector.detect_spike(volume, vol_sma)
+        ratio = ind.get("volume_ratio", volume / vol_sma if vol_sma > 0 else 1.0)
 
-        if spike["is_spike"]:
-            if spike["strength"] == "EXTREME":
-                return 15, f"EXTREME volume {spike['ratio']:.1f}x"
-            elif spike["strength"] == "STRONG":
-                return 13, f"STRONG volume {spike['ratio']:.1f}x"
-            else:
-                return 10, f"Volume spike {spike['ratio']:.1f}x"
-        elif spike["ratio"] > 1.0:
-            return 8, f"Volume {spike['ratio']:.1f}x avg (above normal)"
-        elif spike["ratio"] > 0.7:
-            return 5, f"Volume {spike['ratio']:.1f}x avg (acceptable)"
-        elif spike["ratio"] > 0.4:
-            return 3, f"Volume {spike['ratio']:.1f}x avg (low but not blocking)"
+        if ratio >= 3.0:
+            return 15, f"Extreme volume {ratio:.1f}× SMA (breakout confirmed)"
+        elif ratio >= 2.0:
+            return 13, f"Strong breakout volume {ratio:.1f}× SMA"
+        elif ratio >= 1.5:
+            return 10, f"Elevated volume {ratio:.1f}× SMA (entry quality)"
+        elif ratio >= 1.0:
+            return 7, f"Above-average volume {ratio:.1f}× SMA"
+        elif ratio >= 0.7:
+            return 4, f"Average volume {ratio:.1f}× SMA"
         else:
-            return 2, f"Volume {spike['ratio']:.1f}x avg (base points)"
+            return 2, f"Low volume {ratio:.1f}× SMA (caution)"
+
+    def _structure_score(self, symbol: str, ind: dict) -> tuple:
+        """S/R proximity + ADX trend strength."""
+        score = 0
+        details = {}
+        price = ind.get("close", 0)
+        adx = ind.get("adx", 0)
+
+        # ADX trend strength (5 pts)
+        if adx > 30:
+            score += 5
+            details["adx"] = f"ADX={adx:.0f} — strong trend"
+        elif adx > 25:
+            score += 4
+            details["adx"] = f"ADX={adx:.0f} — trending"
+        elif adx > 20:
+            score += 3
+            details["adx"] = f"ADX={adx:.0f} — developing trend"
+        else:
+            score += 1
+            details["adx"] = f"ADX={adx:.0f} — ranging market"
+
+        # S/R proximity (5 pts)
+        if self.sr.is_near_support(symbol, price):
+            nearest = self.sr.get_nearest_support(symbol, price)
+            if nearest:
+                score += 5
+                touches = nearest.get("touches", 1)
+                details["sr"] = f"Near support ${nearest['level']:.4f} ({touches} touches)"
+        else:
+            res = self.sr.get_nearest_resistance(symbol, price)
+            if res and price > 0:
+                dist = (res["level"] - price) / price
+                if dist > 0.05:
+                    score += 4
+                    details["sr"] = f"Clear to resistance ({dist:.1%} away)"
+                elif dist > 0.02:
+                    score += 3
+                    details["sr"] = f"Some room to resistance ({dist:.1%})"
+                else:
+                    score += 1
+                    details["sr"] = "Near resistance — caution"
+            else:
+                score += 2
+                details["sr"] = "No clear S/R — open air"
+
+        # VWAP check (bonus)
+        vwap = ind.get("vwap", 0)
+        if vwap > 0 and price > vwap:
+            score = min(score + 1, 10)
+            details["vwap"] = f"Price above VWAP (${vwap:.4f})"
+
+        return min(score, 10), details
+
+    def _regime_score(self) -> int:
+        """Soft regime bonus — never blocks, just adjusts."""
+        from src.regime import MODE_AGGRESSIVE, MODE_BALANCED, MODE_DEFENSIVE, MODE_CAPITAL_PRESERVATION
+        mode_scores = {
+            MODE_AGGRESSIVE: 5,
+            MODE_BALANCED: 4,
+            MODE_DEFENSIVE: 3,
+            MODE_CAPITAL_PRESERVATION: 2,
+        }
+        return mode_scores.get(self.regime.current_mode, 3)
+
+    def _sentiment_score(self) -> int:
+        """Fear & Greed + news sentiment."""
+        fg = self.news.fear_greed_value if self.news else 50
+        # Contrarian: extreme fear = good entry (3 pts bonus)
+        if fg < 20:
+            fg_score = 3  # extreme fear = buy opportunity
+        elif fg < 40:
+            fg_score = 2  # fear = slight edge
+        elif fg < 60:
+            fg_score = 2  # neutral
+        elif fg < 75:
+            fg_score = 1  # greed = caution
+        else:
+            fg_score = 0  # extreme greed = danger
+
+        news_score = min(int(self.news.get_sentiment_points() * 2 / 15), 2) if self.news else 1
+        return min(fg_score + news_score, 5)
+
+    def _timing_score(self) -> int:
+        """Time-of-day bonus — peak liquidity = better fills and stronger signals."""
+        now = utc_now()
+        hour = now.hour
+        weekday = now.weekday()  # 0=Monday, 6=Sunday
+
+        score = 0
+        # Peak hours: London open (8-10 UTC) + NY overlap (14-22 UTC)
+        if Settings.strategy.PEAK_HOURS_START <= hour < Settings.strategy.PEAK_HOURS_END:
+            score += 3
+        elif 8 <= hour < 12:  # London open
+            score += 2
+        else:
+            score += 1
+
+        # Best trading days: Tuesday-Thursday
+        if weekday in (1, 2, 3):  # Tue, Wed, Thu
+            score += 2
+        elif weekday in (0, 4):   # Mon, Fri
+            score += 1
+        # Sat/Sun = reduced liquidity = 0 bonus
+
+        return min(score, 5)
 
 
 # ---------------------------------------------------------------------------
-# Signal Generator — SCALPING MODE (no hard gates)
+# Signal Generator
 # ---------------------------------------------------------------------------
 
 class SignalGenerator:
-    """
-    Generates trade signals — SCALPING mode.
-
-    NO hard gates at all. Every asset gets scored.
-    Only the confluence threshold determines if a trade happens.
-    AI is advisory only (never blocks).
-    Designed for maximum opportunity capture.
-    """
+    """Generates trade signals with playbook-based scoring and AI filtering."""
 
     def __init__(self, scorer: ConfluenceScorer, regime_detector, news_intel,
                  ai_advisor=None):
@@ -498,49 +591,70 @@ class SignalGenerator:
         self.regime = regime_detector
         self.news = news_intel
         self.ai = ai_advisor
-        self._cycle_ai_calls: int = 0  # reset each cycle
-        self._cycle_id: int = 0         # tracks which cycle we're in
+        self._cycle_ai_calls: int = 0
+        self._cycle_id: int = 0
 
     async def evaluate(self, symbol: str, indicators_entry: dict,
                        indicators_primary: dict, indicators_trend: dict,
-                       kline_history: list,
-                       portfolio_context: dict = None,
+                       kline_history: list, portfolio_context: dict = None,
                        cycle_id: int = 0) -> Optional[dict]:
-        """Streamlined evaluation: score everything, no gates, just threshold."""
-        # Reset per-cycle AI call counter when cycle changes
+        # Reset AI call counter each cycle
         if cycle_id != self._cycle_id:
             self._cycle_ai_calls = 0
             self._cycle_id = cycle_id
 
         regime_params = self.regime.get_regime_params()
 
-        # Score the setup (no gates — every asset gets scored)
+        # Capital preservation mode: no entries
+        if not regime_params.get("entries_allowed", True):
+            return None
+
+        # Score the setup
         result = self.scorer.score(
             symbol, indicators_entry, indicators_primary, indicators_trend,
             kline_history, regime_params,
         )
-
         if not result["passes"]:
             return None
 
         price = indicators_primary.get("close", 0)
         atr = indicators_primary.get("atr", 0)
+        if price <= 0:
+            return None
 
-        # Build signal with scalping-optimized SL/TP
-        sl_pct = Settings.risk.STOP_LOSS_PCT      # 0.02 (2%)
-        tp_pct = Settings.risk.TAKE_PROFIT_PCT     # 0.03 (3%)
+        # Risk/Reward pre-filter: require ≥1.5:1 R:R
+        stop_loss_price = price * (1 - Settings.risk.STOP_LOSS_PCT)
+        if atr and atr > 0:
+            regime_mult = regime_params.get("stop_atr_mult", 3.0)
+            atr_stop = price - (atr * regime_mult)
+            stop_loss_price = max(stop_loss_price, atr_stop)
+
+        nearest_resistance = self.scorer.sr.get_nearest_resistance(symbol, price)
+        if nearest_resistance:
+            reward = nearest_resistance["level"] - price
+            risk = price - stop_loss_price
+            if risk > 0 and reward / risk < 1.2:
+                # Weak R:R — only allow if score is very high
+                if result["total_score"] < 65:
+                    return None
+
+        take_profit = price * (1 + Settings.risk.TAKE_PROFIT_PCT)
 
         signal = {
             "symbol": symbol,
             "price": price,
             "confluence_score": result["total_score"],
             "breakdown": result["breakdown"],
-            "stop_loss": price * (1 - sl_pct),
-            "take_profit": price * (1 + tp_pct),
+            "stop_loss": stop_loss_price,
+            "take_profit": take_profit,
             "atr": atr,
             "regime": self.regime.current_regime,
-            "fear_greed": self.news.fear_greed_value,
-            "news_sentiment": self.news.get_sentiment_score(),
+            "mode": self.regime.current_mode,
+            "fear_greed": self.news.fear_greed_value if self.news else 50,
+            "news_sentiment": self.news.get_sentiment_score() if self.news else 0,
+            "supertrend_up": indicators_primary.get("supertrend_up", False),
+            "adx": indicators_primary.get("adx", 0),
+            "volume_ratio": indicators_primary.get("volume_ratio", 1.0),
             "volume_spike": VolumeSpikeDetector.detect_spike(
                 indicators_primary.get("volume", 0),
                 indicators_primary.get("volume_sma", 1),
@@ -549,18 +663,18 @@ class SignalGenerator:
             "resistance_levels": self.scorer.sr.get_resistance_prices(symbol),
         }
 
-        # AI analysis — only for top candidates per cycle to preserve token budget
-        max_ai_per_cycle = Settings.ai.MAX_CALLS_PER_CYCLE
-        if self.ai and Settings.ai.ENABLED and self._cycle_ai_calls < max_ai_per_cycle:
+        # AI analysis — only for top candidates per cycle
+        max_ai = Settings.ai.MAX_CALLS_PER_CYCLE
+        if self.ai and Settings.ai.ENABLED and self._cycle_ai_calls < max_ai:
             try:
                 self._cycle_ai_calls += 1
-                recent_news = self.news.get_top_headlines(5)
+                recent_news = self.news.get_top_headlines(5) if self.news else []
                 ai_result = await self.ai.analyze_trade(
                     symbol=symbol,
                     indicators=indicators_primary,
                     regime=self.regime.current_regime,
-                    news_sentiment=self.news.get_sentiment_score(),
-                    fear_greed=self.news.fear_greed_value,
+                    news_sentiment=signal["news_sentiment"],
+                    fear_greed=signal["fear_greed"],
                     support_levels=signal["support_levels"],
                     resistance_levels=signal["resistance_levels"],
                     recent_news=recent_news,
@@ -568,8 +682,6 @@ class SignalGenerator:
                 )
                 signal["ai_analysis"] = ai_result
 
-                # Enforce veto power — but only when AI confidence is high enough.
-                # A low-confidence SKIP (< VETO_MIN_CONFIDENCE) should abstain, not block.
                 approval = self.ai.should_approve_entry(ai_result, result["total_score"])
                 signal["ai_approval"] = approval
 
@@ -579,23 +691,11 @@ class SignalGenerator:
                 if (Settings.ai.VETO_POWER
                         and not approval.get("approved", True)
                         and ai_confidence >= veto_threshold):
-                    logger.info(
-                        "AI vetoed %s (confidence=%.0f%% ≥ %.0f%% threshold): %s",
-                        symbol, ai_confidence * 100, veto_threshold * 100,
-                        approval.get("reason", "")[:80],
-                    )
+                    logger.info("AI vetoed %s (%.0f%% confidence): %s",
+                                symbol, ai_confidence * 100, approval.get("reason", "")[:60])
                     return None
-                elif (Settings.ai.VETO_POWER
-                      and not approval.get("approved", True)
-                      and ai_confidence < veto_threshold):
-                    logger.info(
-                        "AI says SKIP for %s but confidence %.0f%% < %.0f%% threshold — "
-                        "proceeding on confluence (%d/100)",
-                        symbol, ai_confidence * 100, veto_threshold * 100,
-                        result["total_score"],
-                    )
 
-                # AI can suggest tighter SL/TP
+                # AI-suggested SL/TP refinement
                 if approval.get("ai_sl"):
                     ai_sl = price * (1 - approval["ai_sl"])
                     signal["stop_loss"] = max(signal["stop_loss"], ai_sl)
@@ -604,15 +704,15 @@ class SignalGenerator:
                     signal["take_profit"] = min(signal["take_profit"], ai_tp)
 
             except Exception as e:
-                logger.warning("AI analysis failed for %s (non-blocking): %s", symbol, e)
+                logger.warning("AI analysis failed for %s: %s", symbol, e)
                 signal["ai_analysis"] = None
                 signal["ai_approval"] = {"approved": True, "reason": "AI unavailable"}
-        elif self._cycle_ai_calls >= max_ai_per_cycle:
-            # AI budget exhausted for this cycle — proceed on confluence score alone
+        else:
             signal["ai_analysis"] = None
             signal["ai_approval"] = {
                 "approved": True,
-                "reason": f"AI budget ({max_ai_per_cycle} calls/cycle) exhausted — confluence only",
+                "reason": "Confluence-based entry" if self._cycle_ai_calls >= max_ai
+                else "AI disabled",
             }
 
         return signal

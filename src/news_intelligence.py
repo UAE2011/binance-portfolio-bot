@@ -1,3 +1,7 @@
+"""
+News Intelligence — Market sentiment, Fear & Greed, BTC dominance,
+altcoin season index, and RSS headline analysis.
+"""
 import asyncio
 import re
 from datetime import datetime, timezone
@@ -14,11 +18,13 @@ POSITIVE_KEYWORDS = [
     "bullish", "surge", "rally", "adoption", "approval", "breakout", "soar",
     "gain", "pump", "upgrade", "partnership", "launch", "milestone", "record",
     "institutional", "accumulation", "buy", "growth", "inflow", "etf approved",
+    "all-time high", "ath", "recover", "rebound",
 ]
 NEGATIVE_KEYWORDS = [
     "crash", "ban", "hack", "fraud", "liquidation", "bearish", "dump", "plunge",
     "scam", "exploit", "sec", "lawsuit", "investigation", "collapse", "outflow",
     "sell-off", "selloff", "bankrupt", "default", "delisted", "rug pull",
+    "warning", "risk", "concern", "drop", "fall",
 ]
 
 RSS_FEEDS = [
@@ -34,182 +40,220 @@ class NewsIntelligence:
         self.btc_sentiment: float = 0.0
         self.fear_greed_value: int = 50
         self.fear_greed_label: str = "Neutral"
+        self.fear_greed_history: list = []   # last 7 days
         self.btc_dominance: float = 50.0
+        self.altcoin_season_index: int = 50
         self.asset_sentiments: dict = {}
         self.last_update: Optional[datetime] = None
+        self._breaking_news_cache: list = []
 
     async def update_all(self):
         tasks = [
-            self._fetch_crypto_news(),
             self._fetch_fear_greed(),
             self._fetch_btc_dominance(),
             self._fetch_rss_headlines(),
+            self._fetch_crypto_news(),
         ]
         await asyncio.gather(*tasks, return_exceptions=True)
         self.last_update = utc_now()
-        logger.info(
-            "News updated: F&G=%d (%s), BTC sentiment=%.2f, BTC dom=%.1f%%",
-            self.fear_greed_value, self.fear_greed_label,
-            self.btc_sentiment, self.btc_dominance,
-        )
-
-    async def _fetch_crypto_news(self):
-        url = "https://cryptocurrency.cv/api/news"
-        try:
-            async with aiohttp.ClientSession() as session:
-                async with session.get(url, params={"limit": 20},
-                                       timeout=aiohttp.ClientTimeout(total=15)) as resp:
-                    if resp.status == 200:
-                        data = await resp.json()
-                        articles = data if isinstance(data, list) else data.get("data", [])
-                        self.latest_news = []
-                        for article in articles[:20]:
-                            self.latest_news.append({
-                                "title": article.get("title", ""),
-                                "source": article.get("source", ""),
-                                "url": article.get("url", ""),
-                                "published": article.get("published_at", ""),
-                                "sentiment": self._keyword_sentiment(article.get("title", "")),
-                            })
-        except Exception as e:
-            logger.warning("Crypto news fetch failed: %s", e)
-
-        try:
-            async with aiohttp.ClientSession() as session:
-                sentiment_url = "https://cryptocurrency.cv/api/ai/sentiment"
-                async with session.get(sentiment_url, params={"asset": "BTC"},
-                                       timeout=aiohttp.ClientTimeout(total=15)) as resp:
-                    if resp.status == 200:
-                        data = await resp.json()
-                        score = data.get("sentiment", data.get("score", 0))
-                        if isinstance(score, (int, float)):
-                            self.btc_sentiment = float(score)
-                        elif isinstance(score, str):
-                            sentiment_map = {"bullish": 0.5, "bearish": -0.5, "neutral": 0.0}
-                            self.btc_sentiment = sentiment_map.get(score.lower(), 0.0)
-        except Exception as e:
-            logger.warning("AI sentiment fetch failed, using keyword analysis: %s", e)
-            if self.latest_news:
-                scores = [n["sentiment"] for n in self.latest_news]
-                self.btc_sentiment = sum(scores) / len(scores) if scores else 0.0
+        logger.info("News: F&G=%d (%s) | BTC Dom=%.1f%% | AltSeason=%d | Sentiment=%.2f",
+                    self.fear_greed_value, self.fear_greed_label,
+                    self.btc_dominance, self.altcoin_season_index,
+                    self.btc_sentiment)
 
     async def _fetch_fear_greed(self):
         url = "https://api.alternative.me/fng/"
         try:
             async with aiohttp.ClientSession() as session:
-                async with session.get(url, params={"limit": 1, "format": "json"},
-                                       timeout=aiohttp.ClientTimeout(total=10)) as resp:
+                async with session.get(url, params={"limit": 7, "format": "json"},
+                                       timeout=aiohttp.ClientTimeout(total=15)) as resp:
                     if resp.status == 200:
                         data = await resp.json()
-                        fg_data = data.get("data", [{}])[0]
-                        self.fear_greed_value = int(fg_data.get("value", 50))
-                        self.fear_greed_label = fg_data.get("value_classification", "Neutral")
+                        entries = data.get("data", [])
+                        if entries:
+                            latest = entries[0]
+                            self.fear_greed_value = int(latest.get("value", 50))
+                            self.fear_greed_label = latest.get("value_classification", "Neutral")
+                            self.fear_greed_history = [
+                                {"value": int(e.get("value", 50)),
+                                 "label": e.get("value_classification", ""),
+                                 "timestamp": e.get("timestamp", "")}
+                                for e in entries
+                            ]
         except Exception as e:
             logger.warning("Fear & Greed fetch failed: %s", e)
 
     async def _fetch_btc_dominance(self):
-        url = "https://api.coingecko.com/api/v3/global"
+        """Fetch BTC dominance and altcoin season index from CoinGecko."""
         try:
             async with aiohttp.ClientSession() as session:
-                async with session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+                # Global market data
+                url = "https://api.coingecko.com/api/v3/global"
+                async with session.get(url, timeout=aiohttp.ClientTimeout(total=15)) as resp:
                     if resp.status == 200:
                         data = await resp.json()
-                        market_data = data.get("data", {})
-                        self.btc_dominance = market_data.get("market_cap_percentage", {}).get("btc", 50.0)
+                        market = data.get("data", {})
+                        dom = market.get("market_cap_percentage", {})
+                        self.btc_dominance = dom.get("btc", 50.0)
+                        logger.debug("BTC dominance: %.1f%%", self.btc_dominance)
         except Exception as e:
-            logger.warning("BTC dominance fetch failed: %s", e)
+            logger.debug("BTC dominance fetch failed: %s", e)
+
+        # Calculate a rough altcoin season index based on dominance
+        # AltSeason = high when BTC dom falls, low when BTC dom rises
+        # Scale: BTC dom 70% = altseason 15, BTC dom 40% = altseason 85
+        if self.btc_dominance > 0:
+            self.altcoin_season_index = max(0, min(100,
+                int(100 - (self.btc_dominance - 40) * 2.5)
+            ))
 
     async def _fetch_rss_headlines(self):
-        for source_name, feed_url in RSS_FEEDS:
-            try:
-                async with aiohttp.ClientSession() as session:
-                    async with session.get(feed_url, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+        """Parse RSS feeds for news headlines."""
+        headlines = []
+        async with aiohttp.ClientSession() as session:
+            for source, url in RSS_FEEDS:
+                try:
+                    async with session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as resp:
                         if resp.status == 200:
                             content = await resp.text()
                             feed = feedparser.parse(content)
                             for entry in feed.entries[:5]:
                                 title = entry.get("title", "")
-                                sentiment = self._keyword_sentiment(title)
-                                self.latest_news.append({
-                                    "title": title,
-                                    "source": source_name,
-                                    "url": entry.get("link", ""),
-                                    "published": entry.get("published", ""),
-                                    "sentiment": sentiment,
-                                })
-            except Exception as e:
-                logger.debug("RSS feed %s failed: %s", source_name, e)
+                                if title:
+                                    sentiment = self._keyword_sentiment(title)
+                                    headlines.append({
+                                        "title": title,
+                                        "source": source,
+                                        "url": entry.get("link", ""),
+                                        "published": entry.get("published", ""),
+                                        "sentiment": sentiment,
+                                        "is_breaking": self._is_breaking(title),
+                                    })
+                except Exception as e:
+                    logger.debug("RSS fetch failed (%s): %s", source, e)
+
+        if headlines:
+            if not self.latest_news:
+                self.latest_news = headlines
+            else:
+                # Merge, keep latest
+                existing_titles = {n["title"] for n in self.latest_news}
+                new_ones = [h for h in headlines if h["title"] not in existing_titles]
+                self._breaking_news_cache.extend([h for h in new_ones if h.get("is_breaking")])
+                self.latest_news = headlines + [n for n in self.latest_news
+                                                if n["title"] not in {h["title"] for h in headlines}]
+                self.latest_news = self.latest_news[:50]
+
+        # Update BTC sentiment from latest headlines
+        if self.latest_news:
+            scores = [n["sentiment"] for n in self.latest_news[:20]]
+            self.btc_sentiment = sum(scores) / len(scores) if scores else 0.0
+
+    async def _fetch_crypto_news(self):
+        """Try CryptoPanic or similar for asset-specific sentiment."""
+        try:
+            url = "https://cryptopanic.com/api/free/v1/posts/"
+            params = {"auth_token": "pub_free", "filter": "hot", "currencies": "BTC,ETH,SOL"}
+            async with aiohttp.ClientSession() as session:
+                async with session.get(url, params=params,
+                                       timeout=aiohttp.ClientTimeout(total=10)) as resp:
+                    if resp.status == 200:
+                        data = await resp.json()
+                        results = data.get("results", [])
+                        for item in results[:10]:
+                            title = item.get("title", "")
+                            currencies = [c.get("code", "") for c in item.get("currencies", [])]
+                            sentiment = self._keyword_sentiment(title)
+                            for currency in currencies:
+                                symbol = f"{currency}USDT"
+                                if symbol not in self.asset_sentiments:
+                                    self.asset_sentiments[symbol] = []
+                                self.asset_sentiments[symbol].append(sentiment)
+        except Exception as e:
+            logger.debug("CryptoPanic fetch failed: %s", e)
 
     def _keyword_sentiment(self, text: str) -> float:
-        if not text:
-            return 0.0
         text_lower = text.lower()
-        pos_count = sum(1 for kw in POSITIVE_KEYWORDS if kw in text_lower)
-        neg_count = sum(1 for kw in NEGATIVE_KEYWORDS if kw in text_lower)
-        total = pos_count + neg_count
+        pos = sum(1 for kw in POSITIVE_KEYWORDS if kw in text_lower)
+        neg = sum(1 for kw in NEGATIVE_KEYWORDS if kw in text_lower)
+        total = pos + neg
         if total == 0:
             return 0.0
-        return (pos_count - neg_count) / total
+        return (pos - neg) / total
+
+    def _is_breaking(self, title: str) -> bool:
+        breaking_kw = ["breaking", "urgent", "just in", "alert", "crash",
+                       "hack", "ban", "liquidation", "etf approved", "sec"]
+        return any(kw in title.lower() for kw in breaking_kw)
 
     def get_sentiment_score(self) -> float:
-        if not self.latest_news:
-            return self.btc_sentiment
-        news_scores = [n["sentiment"] for n in self.latest_news if n["sentiment"] != 0]
-        if news_scores:
-            avg_news = sum(news_scores) / len(news_scores)
-            return 0.6 * self.btc_sentiment + 0.4 * avg_news
-        return self.btc_sentiment
-
-    def get_asset_sentiment(self, symbol: str) -> float:
-        base = symbol.replace("USDT", "").replace("BUSD", "").lower()
-        relevant = [
-            n for n in self.latest_news
-            if base in n["title"].lower() or symbol.lower() in n["title"].lower()
-        ]
-        if not relevant:
-            return 0.0
-        return sum(n["sentiment"] for n in relevant) / len(relevant)
-
-    def check_breaking_news(self, held_symbols: list) -> list:
-        alerts = []
-        for symbol in held_symbols:
-            base = symbol.replace("USDT", "").replace("BUSD", "").lower()
-            for news in self.latest_news[:10]:
-                title_lower = news["title"].lower()
-                if base in title_lower and news["sentiment"] < -0.3:
-                    alerts.append({
-                        "symbol": symbol,
-                        "headline": news["title"],
-                        "source": news["source"],
-                        "sentiment": news["sentiment"],
-                    })
-        return alerts
+        """Composite sentiment: BTC price sentiment + news."""
+        return (self.btc_sentiment * 0.6 +
+                (self.fear_greed_value / 100 - 0.5) * 0.4)
 
     def get_sentiment_points(self) -> int:
-        fg = self.fear_greed_value
-        if fg <= 25:
-            return 15
-        elif fg <= 40:
-            return 12
-        elif fg <= 60:
-            return 8
-        elif fg <= 75:
-            return 3
-        else:
-            return 0
+        """0-15 point scale for scoring."""
+        score = self.get_sentiment_score()  # -1 to +1
+        return max(0, min(15, int((score + 1) / 2 * 15)))
 
     def is_extreme_fear(self) -> bool:
-        return self.fear_greed_value < 25
+        from config.settings import Settings
+        return self.fear_greed_value <= Settings.portfolio_cfg.DCA_FEAR_THRESHOLD
 
     def is_extreme_greed(self) -> bool:
-        return self.fear_greed_value > 75
+        return self.fear_greed_value >= 80
+
+    def get_asset_sentiment(self, symbol: str) -> float:
+        sentiments = self.asset_sentiments.get(symbol, [])
+        if not sentiments:
+            return 0.0
+        return sum(sentiments) / len(sentiments)
 
     def get_dominance_strategy(self) -> str:
-        if self.btc_dominance > 60:
+        """BTC dominance-based rotation advice."""
+        from config.settings import Settings
+        cfg = Settings.portfolio_cfg
+        if self.btc_dominance >= cfg.BTC_DOM_BTC_FOCUS_THRESHOLD * 100:
             return "BTC_FOCUS"
-        elif self.btc_dominance < 45:
+        elif self.btc_dominance <= cfg.BTC_DOM_ALTSEASON_THRESHOLD * 100:
             return "ALTCOIN_SEASON"
-        return "BALANCED"
+        return "NEUTRAL"
 
-    def get_top_headlines(self, count: int = 5) -> list:
-        return self.latest_news[:count]
+    def get_top_headlines(self, n: int = 5) -> list:
+        return self.latest_news[:n]
+
+    def check_breaking_news(self, symbols: list) -> list:
+        """Check for breaking news affecting held positions."""
+        alerts = []
+        if not symbols or not self.latest_news:
+            return alerts
+        for news in self.latest_news[:10]:
+            title_lower = news["title"].lower()
+            for symbol in symbols:
+                base = symbol.replace("USDT", "").lower()
+                if base in title_lower or news.get("is_breaking"):
+                    if abs(news.get("sentiment", 0)) > 0.3:
+                        alerts.append({**news, "symbol": symbol})
+                        break
+        # Also return cached breaking news
+        alerts.extend(self._breaking_news_cache[-3:])
+        self._breaking_news_cache = []
+        return alerts[:5]
+
+    def get_market_summary(self) -> str:
+        """One-line market summary for Telegram."""
+        dom_strategy = self.get_dominance_strategy()
+        dom_str = {
+            "BTC_FOCUS": "🟠 BTC Season",
+            "ALTCOIN_SEASON": "🟢 Alt Season",
+            "NEUTRAL": "⚪ Neutral",
+        }.get(dom_strategy, "⚪")
+
+        fg_emoji = "😱" if self.fear_greed_value < 20 else \
+                   "😰" if self.fear_greed_value < 40 else \
+                   "😐" if self.fear_greed_value < 60 else \
+                   "😊" if self.fear_greed_value < 80 else "🤑"
+
+        return (f"{fg_emoji} F&G: {self.fear_greed_value} ({self.fear_greed_label}) | "
+                f"BTC Dom: {self.btc_dominance:.1f}% | {dom_str} | "
+                f"AltIdx: {self.altcoin_season_index}")

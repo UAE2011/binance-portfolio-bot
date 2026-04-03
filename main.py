@@ -1,894 +1,609 @@
 """
-Binance Spot Portfolio Trading Bot — Main Orchestrator
+Binance Portfolio Bot — Playbook-optimized trading system.
 
-Features:
-  - AI trading (Groq FREE — llama-3.3-70b + llama-3.1-8b)
-  - 10% wallet rule, 2% SL, 3% TP, trailing stop, 50/50 partial TP
-  - RSI + MACD + Bollinger + S/R + support break exit + volume spike
-  - Multi-timeframe 5m + 15m + 1h
-  - Daily loss limit, weekly report, news sentiment filter
-  - Memory after restart, auto-restart watchdog
-  - Diversified crypto portfolio
-  - REAL-TIME ACTIVITY FEED to Telegram
+Architecture:
+  Regime Detection (HMM + trend + sentiment)
+       ↓
+  Operating Mode (AGGRESSIVE / BALANCED / DEFENSIVE / CAPITAL_PRESERVATION)
+       ↓
+  Asset Scanner + Indicator Engine
+       ↓
+  Confluence Scorer (100-pt playbook model)
+       ↓
+  AI Veto Layer (Gemini 2.5 Flash, top-5 signals only)
+       ↓
+  Risk Manager (Quarter Kelly + Anti-martingale + Portfolio Heat)
+       ↓
+  Execution + OCO Orders + Partial TP
+       ↓
+  Active Position Manager (Chandelier Exit trailing + circuit breakers)
+
+Start: docker-compose up -d --build
+Telegram: /help for all commands
 """
-
-import os
-import sys
-import json
-import signal
 import asyncio
-import time
-from datetime import datetime, timezone
+import json
+import logging
+import sys
+from datetime import datetime, timezone, timedelta
+from pathlib import Path
 
 from config.settings import Settings
-from src.utils import setup_logging, utc_now
 from src.database import Database
-from src.exchange import BinanceExchange
+from src.exchange import Exchange
 from src.indicators import IndicatorSet
 from src.regime import RegimeDetector
-from src.news_intelligence import NewsIntelligence
 from src.risk_manager import RiskManager
 from src.portfolio import PortfolioManager
-from src.scanner import AssetScanner
 from src.strategy import (
-    ConfluenceScorer, SignalGenerator,
-    SupportResistanceEngine, VolumeSpikeDetector,
+    ConfluenceScorer, SignalGenerator, SupportResistanceEngine, VolumeSpikeDetector
 )
-from src.ai_advisor import AIAdvisor
-from src.calibrator import SelfCalibrator
+from src.news_intelligence import NewsIntelligence
 from src.notifier import TelegramNotifier, build_command_handlers
+from src.scanner import AssetScanner
+from src.calibrator import Calibrator
 from src.watchdog import Watchdog
+from src.ai_advisor import AIAdvisor
+from src.utils import setup_logging, utc_now
 
-logger = setup_logging(Settings.ops.LOG_LEVEL)
+logger = setup_logging()
 
-STATE_FILE = Settings.ops.STATE_FILE
+# ─── State tracking ──────────────────────────────────────────────────────────
 
-
-class TradingBot:
+class BotState:
     def __init__(self):
-        # Core infrastructure
-        self.db = Database(Settings.DATABASE_PATH)
-        self.exchange = BinanceExchange(
-            Settings.BINANCE_API_KEY,
-            Settings.BINANCE_API_SECRET,
-            testnet=Settings.TESTNET,
-        )
+        self.cycle_id: int = 0
+        self.last_regime_check: datetime = None
+        self.last_news_update: datetime = None
+        self.last_rebalance_check: datetime = None
+        self.last_dca_attempt: datetime = None
+        self.prev_regime: str = ""
+        self.prev_mode: str = ""
+        self.indicator_sets: dict = {}   # symbol → IndicatorSet (primary)
+        self.indicator_sets_entry: dict = {}  # symbol → IndicatorSet (entry tf)
+        self.indicator_sets_trend: dict = {}  # symbol → IndicatorSet (trend tf)
+        self.kline_history: dict = {}    # symbol → list of last N candles
+        self.running: bool = True
+        self.initialized: bool = False
 
-        # Intelligence layers
-        self.news = NewsIntelligence()
-        self.regime = RegimeDetector(self.exchange, self.db)
-        self.ai = AIAdvisor()
-
-        # Risk & portfolio
-        self.risk = RiskManager(self.db, self.regime)
-        self.risk.set_news_intel(self.news)
-        self.portfolio = PortfolioManager(
-            self.exchange, self.db, self.regime, self.risk, self.news,
-        )
-
-        # Strategy
-        self.sr_engine = SupportResistanceEngine()
-        self.scanner = AssetScanner(self.exchange, self.regime, self.news)
-        self.scorer = ConfluenceScorer(self.regime, self.news, self.db, self.sr_engine)
-        self.signal_gen = SignalGenerator(self.scorer, self.regime, self.news, self.ai)
-
-        # Calibration
-        self.calibrator = SelfCalibrator(self.db, self.risk, self.regime)
-
-        # Notifications
-        self.notifier = TelegramNotifier(
-            Settings.TELEGRAM_BOT_TOKEN,
-            Settings.TELEGRAM_CHAT_ID,
-        )
-
-        # Watchdog
-        self.watchdog = Watchdog(self.exchange, self.db)
-
-        # Data caches — multi-timeframe
-        self.indicator_cache: dict = {}   # symbol -> {tf -> IndicatorSet}
-        self.kline_history: dict = {}     # symbol -> {tf -> [candles]}
-        self.watchlist: list = []
-
-        # State
-        self._shutdown = False
-        self._last_scan_time: float = 0
-        self._last_news_time: float = 0
-        self._last_regime_time: float = 0
-        self._last_rebalance_day: int = -1
-        self._last_weekly_report_day: int = -1
-
-        # Activity feed control — avoid spamming Telegram
-        self._cycle_count: int = 0
-        self._last_activity_msg_time: float = 0
-        self._ACTIVITY_COOLDOWN: int = 300  # Send activity summary every 5 min max
-
-    async def start(self):
-        logger.info("=" * 60)
-        logger.info("BINANCE PORTFOLIO BOT STARTING")
-        logger.info("Testnet: %s | AI: %s | Fast: %s | Strong: %s",
-                     Settings.TESTNET, Settings.ai.ENABLED,
-                     Settings.ai.FAST_MODEL, Settings.ai.STRONG_MODEL)
-        logger.info("=" * 60)
-
-        # Setup signal handlers (not supported on Windows outside Docker)
+    def save(self, path: str = "data/bot_state.json"):
+        Path(path).parent.mkdir(parents=True, exist_ok=True)
         try:
-            loop = asyncio.get_event_loop()
-            for sig in (signal.SIGTERM, signal.SIGINT):
-                loop.add_signal_handler(
-                    sig, lambda: asyncio.create_task(self._shutdown_handler()),
-                )
-        except NotImplementedError:
-            logger.warning("Signal handlers not supported on this OS, using KeyboardInterrupt fallback")
+            with open(path, "w") as f:
+                json.dump({
+                    "cycle_id": self.cycle_id,
+                    "prev_regime": self.prev_regime,
+                    "prev_mode": self.prev_mode,
+                    "timestamp": utc_now().isoformat(),
+                }, f)
+        except Exception:
+            pass
 
-        # Initialize all components
-        self.db.init_db()
-        await self.exchange.initialize()
-        await self.notifier.send_message(
-            "<b>INITIALIZING...</b>\n"
-            "Connecting to Binance, loading news, training regime model..."
-        )
-        await self.news.update_all()
-        await self.regime.initialize()
-        self.risk.initialize_from_history()
-        self.calibrator.initialize()
-
-        # Restore state from last run (memory after restart)
-        await self._restore_state()
-
-        # Sync portfolio with exchange
-        await self.portfolio.sync_with_exchange()
-
-        # Register Telegram commands
-        handlers = build_command_handlers(
-            self.portfolio, self.risk, self.calibrator,
-            self.watchdog, self.regime, self.news, self.ai,
-        )
-        self.notifier.register_commands(handlers)
-
-        # Startup notification
-        await self.notifier.send_message(
-            f"<b>BOT STARTED</b>\n\n"
-            f"<b>Mode:</b> <code>{'TESTNET' if Settings.TESTNET else 'LIVE'}</code>\n"
-            f"<b>AI Fast:</b> <code>{Settings.ai.FAST_MODEL}</code>\n"
-            f"<b>AI Strong:</b> <code>{Settings.ai.STRONG_MODEL}</code>\n"
-            f"<b>Portfolio:</b> <code>${self.portfolio.portfolio_value:.2f}</code>\n"
-            f"<b>Regime:</b> <code>{self.regime.current_regime}</code>\n"
-            f"<b>Fear/Greed:</b> <code>{self.news.fear_greed_value} ({self.news.fear_greed_label})</code>\n"
-            f"<b>Open Positions:</b> <code>{len(self.portfolio.open_positions)}</code>\n"
-            f"<b>Veto Power:</b> <code>{Settings.ai.VETO_POWER}</code>\n"
-            f"<b>Confluence Threshold:</b> <code>{Settings.strategy.CONFLUENCE_SCORE_THRESHOLD}/100</code>\n"
-            f"<b>Scan Interval:</b> <code>{Settings.strategy.SCAN_INTERVAL_SECONDS}s</code>\n"
-            f"<b>Timeframes:</b> <code>{', '.join(Settings.strategy.TIMEFRAMES)}</code>"
-        )
-
-        # Initial scan
-        await self._initial_scan()
-
-        # Start watchdog
-        await self.watchdog.start()
-
-        # Launch all loops
-        await asyncio.gather(
-            self._main_loop(),
-            self._position_monitor_loop(),
-            self._scheduled_tasks_loop(),
-            self._activity_feed_loop(),
-            self.notifier.start_polling(),
-        )
-
-    # ------------------------------------------------------------------
-    # State Persistence (Memory After Restart)
-    # ------------------------------------------------------------------
-
-    async def _restore_state(self):
-        """Restore bot state from database and state file."""
+    def load(self, path: str = "data/bot_state.json"):
         try:
-            saved_watchlist = self.db.load_state("watchlist")
-            if saved_watchlist:
-                self.watchlist = json.loads(saved_watchlist)
-                logger.info("Restored watchlist: %d symbols", len(self.watchlist))
+            if Path(path).exists():
+                with open(path) as f:
+                    data = json.load(f)
+                self.cycle_id = data.get("cycle_id", 0)
+                self.prev_regime = data.get("prev_regime", "")
+                self.prev_mode = data.get("prev_mode", "")
+        except Exception:
+            pass
 
-            last_scan = self.db.load_state("last_scan_time")
-            if last_scan:
-                self._last_scan_time = float(last_scan)
 
-            last_news = self.db.load_state("last_news_time")
-            if last_news:
-                self._last_news_time = float(last_news)
+# ─── Initialization ──────────────────────────────────────────────────────────
 
-            if os.path.exists(STATE_FILE):
-                with open(STATE_FILE, "r") as f:
-                    state = json.load(f)
-                logger.info("Restored state file: %s", list(state.keys()))
+async def initialize_indicators(bot_state: BotState, scanner: AssetScanner,
+                                exchange: Exchange):
+    """Seed indicators for watchlist + core assets."""
+    watchlist = await scanner.get_watchlist()
+    core = await scanner.get_core_assets()
+    all_symbols = list({a["symbol"] for a in watchlist + core})
 
-            logger.info("State restoration complete")
+    primary_tf = Settings.strategy.PRIMARY_TIMEFRAME   # 1h
+    entry_tf = Settings.strategy.ENTRY_TIMEFRAME       # 15m
+    trend_tf = Settings.strategy.TREND_TIMEFRAME       # 4h
+
+    seeds = 0
+    for symbol in all_symbols[:60]:  # seed top 60
+        try:
+            for tf, store in [(primary_tf, bot_state.indicator_sets),
+                              (entry_tf, bot_state.indicator_sets_entry),
+                              (trend_tf, bot_state.indicator_sets_trend)]:
+                if symbol not in store:
+                    store[symbol] = IndicatorSet()
+                klines = await exchange.get_klines(symbol, tf, limit=250)
+                if klines:
+                    store[symbol].seed_from_klines(klines)
+
+            # Keep primary kline history
+            klines_primary = await exchange.get_klines(symbol, primary_tf, limit=200)
+            bot_state.kline_history[symbol] = klines_primary
+            seeds += 1
         except Exception as e:
-            logger.warning("State restoration failed (fresh start): %s", e)
+            logger.debug("Seed error %s: %s", symbol, e)
 
-    def _save_state(self):
-        """Persist current state for restart recovery."""
+    logger.info("Seeded indicators for %d symbols", seeds)
+
+
+# ─── Active Position Management ──────────────────────────────────────────────
+
+async def manage_open_positions(portfolio: PortfolioManager, risk: RiskManager,
+                                notifier: TelegramNotifier, calibrator: Calibrator,
+                                bot_state: BotState, sr_engine: SupportResistanceEngine):
+    """
+    For each open position:
+    1. Update trailing stop (Chandelier Exit)
+    2. Check partial TP (50% at 6% gain)
+    3. Check stop-loss hit
+    4. Check support break
+    5. Execute exits as needed
+    """
+    if not portfolio.open_positions:
+        return
+
+    exits_executed = []
+
+    for trade in list(portfolio.open_positions):
+        symbol = trade["symbol"]
         try:
-            self.db.save_state("watchlist", json.dumps(self.watchlist))
-            self.db.save_state("last_scan_time", str(self._last_scan_time))
-            self.db.save_state("last_news_time", str(self._last_news_time))
+            current_price = await portfolio.exchange.get_price(symbol)
+        except Exception:
+            continue
 
-            state = {
-                "saved_at": utc_now().isoformat(),
-                "watchlist": self.watchlist,
-                "regime": self.regime.current_regime,
-                "portfolio_value": self.portfolio.portfolio_value,
-                "open_positions": len(self.portfolio.open_positions),
-            }
-            os.makedirs(os.path.dirname(STATE_FILE) or ".", exist_ok=True)
-            with open(STATE_FILE, "w") as f:
-                json.dump(state, f, indent=2)
-        except Exception as e:
-            logger.error("State save failed: %s", e)
+        # Update highest price
+        trade["highest_price"] = max(trade.get("highest_price", trade["entry_price"]),
+                                     current_price)
 
-    # ------------------------------------------------------------------
-    # Initial Scan & Indicator Seeding
-    # ------------------------------------------------------------------
+        # Get current ATR
+        ind = bot_state.indicator_sets.get(symbol)
+        current_atr = ind.latest.get("atr", 0) if ind and ind.latest else trade.get("atr", 0)
 
-    async def _initial_scan(self):
-        """Scan market, build watchlist, seed indicators for all timeframes."""
-        logger.info("Running initial market scan...")
-        await self.notifier.send_message(
-            "<b>SCANNING MARKET...</b>\n"
-            f"Filtering {Settings.strategy.MAX_WATCHLIST_SIZE} top assets by volume, "
-            f"min 24h vol: ${Settings.strategy.MIN_24H_VOLUME:,.0f}"
-        )
+        # 1. Update trailing stop
+        updates = risk.update_trailing_stop(trade, current_price, current_atr)
+        new_stop = updates.get("stop_loss", trade["stop_loss"])
+        new_highest = updates.get("highest_price", trade.get("highest_price"))
 
-        candidates = await self.scanner.scan_universe()
-        self.watchlist = self.scanner.get_watchlist_symbols()
+        if (new_stop != trade.get("stop_loss")
+                or new_highest != trade.get("highest_price")):
+            portfolio.db.update_trade(trade["id"], {
+                "stop_loss": new_stop,
+                "highest_price": new_highest,
+            })
+            trade["stop_loss"] = new_stop
+            trade["highest_price"] = new_highest
 
-        # Add symbols from open positions
-        for pos in self.portfolio.open_positions:
-            if pos["symbol"] not in self.watchlist:
-                self.watchlist.append(pos["symbol"])
-
-        logger.info("Watchlist: %d symbols — %s", len(self.watchlist),
-                     ", ".join(self.watchlist[:10]))
-
-        await self.notifier.send_message(
-            f"<b>WATCHLIST BUILT</b>\n"
-            f"Tracking <code>{len(self.watchlist)}</code> assets\n"
-            f"Top 10: <code>{', '.join(self.watchlist[:10])}</code>\n\n"
-            f"Seeding indicators for all timeframes..."
-        )
-
-        # Seed indicators for all timeframes (batched to avoid rate limits)
-        seeded = 0
-        batch_size = 5
-        for i in range(0, len(self.watchlist), batch_size):
-            batch = self.watchlist[i:i + batch_size]
-            for symbol in batch:
-                await self._seed_indicators(symbol)
-                seeded += 1
-            logger.info("Seeded %d/%d symbols...", seeded, len(self.watchlist))
-            await asyncio.sleep(2)  # 2s pause between batches to respect rate limits
-
-        # Compute S/R levels for all watchlist symbols
-        for symbol in self.watchlist:
-            tf_key = Settings.strategy.PRIMARY_TIMEFRAME
-            history = self.kline_history.get(symbol, {}).get(tf_key, [])
-            if history:
-                self.sr_engine.compute_levels(symbol, history)
-
-        # Start WebSocket for entry timeframe klines
-        entry_tf = Settings.strategy.ENTRY_TIMEFRAME
-        if self.watchlist:
-            await self.exchange.start_kline_stream(
-                self.watchlist, entry_tf, self._on_kline_update,
+        # 2. Check partial TP
+        partial_exits = risk.check_take_profit_tranches(trade, current_price, current_atr)
+        for pe in partial_exits:
+            result = await portfolio.execute_exit(
+                trade, pe["quantity"], pe["reason"], current_price
             )
+            if result:
+                exits_executed.append(result)
+                await notifier.notify_exit(result)
+                trade["tranche_exits"] = portfolio.db.get_trade_by_id(trade["id"])["tranche_exits"]
 
-        self._save_state()
+        # 3. Stop-loss check
+        current_stop = trade.get("stop_loss", 0)
+        if current_stop > 0 and current_price <= current_stop:
+            remaining = trade.get("remaining_quantity", trade["quantity"])
+            result = await portfolio.execute_exit(
+                trade, remaining,
+                f"STOP_LOSS@{current_stop:.4f}", current_price
+            )
+            if result:
+                exits_executed.append(result)
+                calibrator.on_trade_closed()
+                await notifier.notify_exit(result)
+            continue
 
-        await self.notifier.send_message(
-            f"<b>READY TO TRADE</b>\n"
-            f"Indicators seeded for {seeded} assets\n"
-            f"WebSocket streaming {entry_tf} candles\n"
-            f"S/R levels computed\n\n"
-            f"<i>Bot is now actively scanning every {Settings.strategy.SCAN_INTERVAL_SECONDS}s...</i>"
-        )
-        logger.info("Initial scan complete")
+        # 4. Take-profit (full)
+        tp = trade.get("take_profit", 0)
+        if tp > 0 and current_price >= tp:
+            remaining = trade.get("remaining_quantity", trade["quantity"])
+            result = await portfolio.execute_exit(
+                trade, remaining,
+                f"TAKE_PROFIT@{tp:.4f}", current_price
+            )
+            if result:
+                exits_executed.append(result)
+                calibrator.on_trade_closed()
+                await notifier.notify_exit(result)
+            continue
 
-    async def _seed_indicators(self, symbol: str):
-        """Seed indicators for configured timeframes."""
-        self.indicator_cache[symbol] = {}
-        self.kline_history[symbol] = {}
+        # 5. Support break exit
+        if Settings.risk.SUPPORT_BREAK_EXIT:
+            sb = sr_engine.check_support_break(symbol, current_price)
+            if sb and sb.get("broken") and sb.get("touches", 0) >= 2:
+                remaining = trade.get("remaining_quantity", trade["quantity"])
+                result = await portfolio.execute_exit(
+                    trade, remaining,
+                    f"SUPPORT_BREAK@{sb['support_level']:.4f}", current_price
+                )
+                if result:
+                    exits_executed.append(result)
+                    calibrator.on_trade_closed()
+                    await notifier.notify_exit(result)
 
-        for tf in Settings.strategy.TIMEFRAMES:
-            try:
-                klines = await self.exchange.get_klines(symbol, tf, 200)
-                if not klines:
-                    continue
-                ind_set = IndicatorSet()
-                ind_set.seed_from_klines(klines)
-                self.indicator_cache[symbol][tf] = ind_set
-                self.kline_history[symbol][tf] = klines[-100:]
-            except Exception as e:
-                logger.debug("Failed to seed %s %s: %s", symbol, tf, e)
+        # 6. Breaking news exit
+        breaking = portfolio.news.check_breaking_news([symbol])
+        for alert in breaking:
+            if alert.get("sentiment", 0) < -0.5:
+                remaining = trade.get("remaining_quantity", trade["quantity"])
+                result = await portfolio.execute_exit(
+                    trade, remaining,
+                    f"NEWS_ALERT:{alert.get('title', '')[:30]}", current_price
+                )
+                if result:
+                    exits_executed.append(result)
+                    calibrator.on_trade_closed()
+                    await notifier.notify_exit(result)
 
-    # ------------------------------------------------------------------
-    # WebSocket Kline Handler
-    # ------------------------------------------------------------------
+    return exits_executed
 
-    async def _on_kline_update(self, data: dict):
-        """Process real-time kline updates from WebSocket."""
+
+# ─── Signal Scanning ─────────────────────────────────────────────────────────
+
+async def scan_for_signals(scanner: AssetScanner, bot_state: BotState,
+                           exchange: Exchange, signal_gen: SignalGenerator,
+                           sr_engine: SupportResistanceEngine) -> list:
+    """Fetch latest candles, update indicators, generate signals."""
+    watchlist = await scanner.get_watchlist()
+    core = await scanner.get_core_assets()
+
+    # Deduplicate, core assets get priority
+    seen = set()
+    all_assets = []
+    for a in core + watchlist:
+        if a["symbol"] not in seen:
+            seen.add(a["symbol"])
+            all_assets.append(a)
+
+    primary_tf = Settings.strategy.PRIMARY_TIMEFRAME
+    entry_tf = Settings.strategy.ENTRY_TIMEFRAME
+    trend_tf = Settings.strategy.TREND_TIMEFRAME
+
+    signals = []
+    bot_state.cycle_id += 1
+
+    for asset in all_assets:
+        symbol = asset["symbol"]
         try:
-            symbol = data.get("s", "")
-            kline = data.get("k", {})
-            is_closed = kline.get("x", False)
+            # Fetch latest candle for each timeframe
+            for tf, store in [(primary_tf, bot_state.indicator_sets),
+                              (entry_tf, bot_state.indicator_sets_entry),
+                              (trend_tf, bot_state.indicator_sets_trend)]:
+                if symbol not in store:
+                    store[symbol] = IndicatorSet()
+                latest_candles = await exchange.get_klines(symbol, tf, limit=3)
+                if latest_candles:
+                    for candle in latest_candles[-2:]:
+                        store[symbol].update_candle(candle)
 
-            candle = {
-                "open": float(kline.get("o", 0)),
-                "high": float(kline.get("h", 0)),
-                "low": float(kline.get("l", 0)),
-                "close": float(kline.get("c", 0)),
-                "volume": float(kline.get("v", 0)),
-            }
+            # Update kline history (rolling 200)
+            latest_primary = await exchange.get_klines(symbol, primary_tf, limit=5)
+            if latest_primary:
+                existing = bot_state.kline_history.get(symbol, [])
+                for c in latest_primary:
+                    if not existing or c["open_time"] != existing[-1]["open_time"]:
+                        existing.append(c)
+                bot_state.kline_history[symbol] = existing[-200:]
 
-            if symbol not in self.indicator_cache:
-                return
+            # Compute S/R levels (every 10 cycles)
+            if bot_state.cycle_id % 10 == 1:
+                history = bot_state.kline_history.get(symbol, [])
+                if len(history) >= 50:
+                    sr_engine.compute_levels(symbol, history)
 
-            entry_tf = Settings.strategy.ENTRY_TIMEFRAME
-            ind = self.indicator_cache[symbol].get(entry_tf)
-            if ind is None:
-                return
-
-            if is_closed:
-                ind.update_candle(candle)
-                history = self.kline_history.get(symbol, {}).get(entry_tf, [])
-                history.append(candle)
-                if len(history) > 200:
-                    history.pop(0)
-                self.kline_history.setdefault(symbol, {})[entry_tf] = history
-                self.watchdog.beat()
-            else:
-                ind.update_tick(candle["close"])
-
-        except Exception as e:
-            logger.debug("Kline update error: %s", e)
-
-    # ------------------------------------------------------------------
-    # Main Trading Loop
-    # ------------------------------------------------------------------
-
-    async def _main_loop(self):
-        """Main trading cycle — scans watchlist and generates signals."""
-        logger.info("Main trading loop started (interval=%ds)",
-                     Settings.strategy.SCAN_INTERVAL_SECONDS)
-        while not self._shutdown:
-            try:
-                await self._trading_cycle()
-            except Exception as e:
-                logger.error("Trading cycle error: %s", e)
-            await asyncio.sleep(Settings.strategy.SCAN_INTERVAL_SECONDS)
-
-    async def _trading_cycle(self):
-        self.watchdog.beat()
-        self._cycle_count += 1
-
-        if self.risk.kill_switch_active:
-            logger.info("Cycle %d: Kill switch active — skipping", self._cycle_count)
-            prev = getattr(self, "_last_cycle_stats", {})
-            self._last_cycle_stats = {
-                **prev,
-                "cycle": self._cycle_count,
-                "regime": self.regime.current_regime,
-                "portfolio_value": self.portfolio.portfolio_value,
-                "positions": len(self.portfolio.open_positions),
-            }
-            return
-        if self.risk.is_paused:
-            logger.info("Cycle %d: Trading paused — skipping", self._cycle_count)
-            prev = getattr(self, "_last_cycle_stats", {})
-            self._last_cycle_stats = {
-                **prev,
-                "cycle": self._cycle_count,
-                "regime": self.regime.current_regime,
-                "portfolio_value": self.portfolio.portfolio_value,
-                "positions": len(self.portfolio.open_positions),
-            }
-            return
-
-        regime_params = self.regime.get_regime_params()
-        # Regime NEVER blocks entries — it only adjusts position sizing
-        # entries_allowed is always True in aggressive mode
-
-        # Refresh higher timeframes
-        await self._refresh_higher_timeframes()
-
-        portfolio_context = self.portfolio.get_status()
-        held_symbols = {p["symbol"] for p in self.portfolio.open_positions}
-
-        # Track cycle stats for activity feed
-        symbols_scanned = 0
-        signals_found = 0
-        trades_executed = 0
-        top_scores = []  # (symbol, score) for top candidates
-
-        for symbol in self.watchlist:
-            if symbol in held_symbols:
-                continue  # Already holding
-
-            entry_tf = Settings.strategy.ENTRY_TIMEFRAME
-            primary_tf = Settings.strategy.PRIMARY_TIMEFRAME
-            trend_tf = Settings.strategy.TREND_TIMEFRAME
-
-            ind_entry = self.indicator_cache.get(symbol, {}).get(entry_tf, IndicatorSet()).latest
-            ind_primary = self.indicator_cache.get(symbol, {}).get(primary_tf, IndicatorSet()).latest
-            ind_trend = self.indicator_cache.get(symbol, {}).get(trend_tf, IndicatorSet()).latest
-            history_primary = self.kline_history.get(symbol, {}).get(primary_tf, [])
+            ind_primary = bot_state.indicator_sets[symbol].latest
+            ind_entry = bot_state.indicator_sets_entry.get(symbol, bot_state.indicator_sets[symbol]).latest
+            ind_trend = bot_state.indicator_sets_trend.get(symbol, bot_state.indicator_sets[symbol]).latest
 
             if not ind_primary:
                 continue
 
-            symbols_scanned += 1
+            history = bot_state.kline_history.get(symbol, [])
 
-            signal = await self.signal_gen.evaluate(
-                symbol, ind_entry, ind_primary, ind_trend, history_primary,
-                portfolio_context,
-                cycle_id=self._cycle_count,
+            signal = await signal_gen.evaluate(
+                symbol=symbol,
+                indicators_entry=ind_entry or ind_primary,
+                indicators_primary=ind_primary,
+                indicators_trend=ind_trend or ind_primary,
+                kline_history=history,
+                cycle_id=bot_state.cycle_id,
             )
-
             if signal:
-                signals_found += 1
-                score = signal.get("confluence_score", 0)
-                top_scores.append((symbol, score))
+                signals.append(signal)
 
-                trade = await self.portfolio.execute_entry(signal)
-                if trade:
-                    trades_executed += 1
-                    await self.notifier.notify_entry(trade)
-                    self.calibrator.check_and_calibrate()
-                    self._save_state()
+        except Exception as e:
+            logger.debug("Scan error %s: %s", symbol, e)
 
-        # Log cycle summary
-        logger.info(
-            "Cycle %d: scanned=%d, signals=%d, trades=%d, positions=%d",
-            self._cycle_count, symbols_scanned, signals_found,
-            trades_executed, len(self.portfolio.open_positions),
+    # Sort by confluence score desc
+    signals.sort(key=lambda s: s["confluence_score"], reverse=True)
+    logger.info("Cycle %d: %d assets scanned, %d signals above threshold",
+                bot_state.cycle_id, len(all_assets), len(signals))
+    return signals
+
+
+# ─── Circuit Breaker Enforcement ─────────────────────────────────────────────
+
+async def enforce_circuit_breakers(portfolio: PortfolioManager, risk: RiskManager,
+                                   notifier: TelegramNotifier):
+    dd = risk.check_drawdown(portfolio.portfolio_value)
+    action = dd.get("action", "NONE")
+
+    if action == "NONE" or action == "WARNING":
+        return
+
+    await notifier.notify_circuit_breaker(dd)
+
+    if action == "DEFENSIVE":
+        risk.position_size_modifier = 0.5
+
+    elif action == "EMERGENCY_LIQUIDATE_50":
+        positions_to_close = portfolio.open_positions[:len(portfolio.open_positions)//2]
+        for trade in positions_to_close:
+            price = await portfolio.exchange.get_price(trade["symbol"])
+            result = await portfolio.execute_exit(
+                trade, trade.get("remaining_quantity", trade["quantity"]),
+                "CIRCUIT_BREAKER_50PCT", price,
+            )
+            if result:
+                await notifier.notify_exit(result)
+
+    elif action == "CAPITAL_PRESERVATION":
+        results = await portfolio.liquidate_all("CIRCUIT_BREAKER_CAPITAL_PRESERVATION")
+        for result in results:
+            await notifier.notify_exit(result)
+        risk.position_size_modifier = 0.15
+
+    elif action == "KILL_SWITCH":
+        results = await portfolio.liquidate_all("KILL_SWITCH")
+        for result in results:
+            await notifier.notify_exit(result)
+        risk.kill_switch_active = True
+        await notifier.send_alert(
+            f"🚨 KILL SWITCH ACTIVATED\n"
+            f"Drawdown: {dd['drawdown_pct']:.1%}\n"
+            f"All positions closed. Send /resume to restart."
         )
 
-        # Store cycle stats for activity feed
-        self._last_cycle_stats = {
-            "cycle": self._cycle_count,
-            "scanned": symbols_scanned,
-            "signals": signals_found,
-            "trades": trades_executed,
-            "positions": len(self.portfolio.open_positions),
-            "top_scores": sorted(top_scores, key=lambda x: x[1], reverse=True)[:5],
-            "regime": self.regime.current_regime,
-            "portfolio_value": self.portfolio.portfolio_value,
-        }
 
-    async def _refresh_higher_timeframes(self):
-        """Refresh primary and trend timeframe indicators from REST API.
-        Only refreshes every 5 minutes to avoid rate limits.
-        Processes in batches of 10 with 1s delay between batches.
-        """
-        now = time.time()
-        if now - getattr(self, '_last_tf_refresh', 0) < 300:  # 5 min cooldown
-            return
-        self._last_tf_refresh = now
+# ─── Scheduled Tasks ─────────────────────────────────────────────────────────
 
-        primary_tf = Settings.strategy.PRIMARY_TIMEFRAME
-        trend_tf = Settings.strategy.TREND_TIMEFRAME
+async def scheduled_tasks(portfolio: PortfolioManager, regime: RegimeDetector,
+                          news: NewsIntelligence, risk: RiskManager,
+                          notifier: TelegramNotifier, bot_state: BotState):
+    now = utc_now()
 
-        batch_size = 10
-        for i in range(0, len(self.watchlist), batch_size):
-            batch = self.watchlist[i:i + batch_size]
-            for symbol in batch:
-                for tf in [primary_tf, trend_tf]:
-                    try:
-                        klines = await self.exchange.get_klines(symbol, tf, 5)
-                        if not klines:
-                            continue
-                        ind_set = self.indicator_cache.get(symbol, {}).get(tf)
-                        if ind_set is None:
-                            continue
-                        history = self.kline_history.get(symbol, {}).get(tf, [])
-                        for k in klines:
-                            if not history or k.get("open_time", 0) != history[-1].get("open_time", -1):
-                                ind_set.update_candle(k)
-                                history.append(k)
-                                if len(history) > 200:
-                                    history.pop(0)
-                        self.kline_history.setdefault(symbol, {})[tf] = history
-                    except Exception as e:
-                        logger.debug("Refresh %s %s failed: %s", symbol, tf, e)
-            await asyncio.sleep(1)  # Rate limit: 1s between batches of 10
-
-    # ------------------------------------------------------------------
-    # Activity Feed Loop — Real-time Telegram updates
-    # ------------------------------------------------------------------
-
-    async def _activity_feed_loop(self):
-        """Send periodic activity summaries to Telegram so user knows what bot is doing."""
-        logger.info("Activity feed loop started (interval=%ds)", self._ACTIVITY_COOLDOWN)
-        await asyncio.sleep(60)  # Wait for first cycle to complete
-
-        while not self._shutdown:
-            try:
-                now = time.time()
-                if now - self._last_activity_msg_time >= self._ACTIVITY_COOLDOWN:
-                    await self._send_activity_summary()
-                    self._last_activity_msg_time = now
-            except Exception as e:
-                logger.debug("Activity feed error: %s", e)
-            await asyncio.sleep(30)
-
-    async def _send_activity_summary(self):
-        """Build and send a concise activity summary."""
-        stats = getattr(self, "_last_cycle_stats", None)
-        if not stats:
-            return
-
-        # Build position summary with live P&L
-        pos_lines = []
-        for p in self.portfolio.open_positions[:5]:
-            try:
-                price = await self.exchange.get_price(p["symbol"])
-                pnl_pct = ((price / p["entry_price"]) - 1) * 100
-                arrow = "▲" if pnl_pct >= 0 else "▼"
-                pos_lines.append(
-                    f"  {arrow} {p['symbol']}: {pnl_pct:+.2f}%"
-                )
-            except Exception:
-                pos_lines.append(f"  {p['symbol']}: (price unavailable)")
-
-        pos_text = "\n".join(pos_lines) if pos_lines else "  No open positions"
-
-        # Build top candidates
-        top_text = ""
-        if stats.get("top_scores"):
-            top_lines = [f"  {sym}: {score}/100" for sym, score in stats["top_scores"][:3]]
-            top_text = "\n<b>Top Candidates:</b>\n" + "\n".join(top_lines)
-
-        # AI status
-        ai_status = self.ai.get_status()
-        ai_calls = ai_status.get("daily_calls", 0)
-
-        portfolio_val = stats.get("portfolio_value", self.portfolio.portfolio_value)
-        cash = self.portfolio.cash_available
-
-        msg = (
-            f"<b>ACTIVITY UPDATE</b>\n"
-            f"Cycle: <code>{stats['cycle']}</code>\n"
-            f"Scanned: <code>{stats.get('scanned', '—')}</code> assets\n"
-            f"Signals Found: <code>{stats.get('signals', '—')}</code>\n"
-            f"Trades Executed: <code>{stats.get('trades', '—')}</code>\n"
-            f"Regime: <code>{stats['regime']}</code>\n"
-            f"Portfolio: <code>${portfolio_val:.2f}</code> "
-            f"(Cash: <code>${cash:.2f}</code>)\n"
-            f"AI Calls Today: <code>{ai_calls}</code>\n\n"
-            f"<b>Open Positions ({len(self.portfolio.open_positions)}):</b>\n"
-            f"<code>{pos_text}</code>"
+    # News update every 15 min
+    news_interval = timedelta(minutes=Settings.strategy.NEWS_CHECK_INTERVAL_MINUTES)
+    if (bot_state.last_news_update is None
+            or (now - bot_state.last_news_update) >= news_interval):
+        await news.update_all()
+        regime.update_sentiment(
+            fear_greed=news.fear_greed_value,
+            news_sentiment=news.get_sentiment_score(),
+            btc_dominance=news.btc_dominance / 100,
+            altcoin_season_index=news.altcoin_season_index,
         )
+        bot_state.last_news_update = now
 
-        if top_text:
-            msg += f"\n{top_text}"
+    # Regime re-detection every hour
+    if (bot_state.last_regime_check is None
+            or (now - bot_state.last_regime_check) >= timedelta(hours=1)):
+        old_regime = regime.current_regime
+        old_mode = regime.current_mode
+        await regime.detect_regime()
+        bot_state.last_regime_check = now
 
-        # Status hint with actionable guidance
-        if self.risk.kill_switch_active:
-            msg += (
-                "\n\n⛔ <b>Kill switch ACTIVE</b> — no new trades\n"
-                "<i>Send /resume to unlock trading</i>"
+        if regime.current_regime != old_regime:
+            await notifier.notify_regime_change(old_regime, regime.current_regime)
+            bot_state.prev_regime = old_regime
+        if regime.current_mode != old_mode:
+            await notifier.notify_mode_change(old_mode, regime.current_mode)
+            bot_state.prev_mode = old_mode
+
+    # HMM retrain weekly
+    if await regime.should_retrain():
+        await regime.train_hmm()
+
+    # Rebalance check every 4 hours
+    if (bot_state.last_rebalance_check is None
+            or (now - bot_state.last_rebalance_check) >= timedelta(hours=4)):
+        actions = await portfolio.check_rebalancing()
+        if actions:
+            results = await portfolio.execute_rebalancing(actions)
+            for r in results:
+                await notifier.notify_exit(r)
+        bot_state.last_rebalance_check = now
+
+    # Smart DCA during extreme fear (every 6 hours)
+    if (bot_state.last_dca_attempt is None
+            or (now - bot_state.last_dca_attempt) >= timedelta(hours=6)):
+        if news.is_extreme_fear():
+            await portfolio.smart_dca()
+        bot_state.last_dca_attempt = now
+
+    # Daily report at UTC midnight
+    if now.hour == 0 and now.minute < 2:
+        await notifier.send_daily_report(portfolio, regime, news, risk)
+
+    # Weekly report
+    weekly_day = Settings.ops.WEEKLY_REPORT_DAY
+    weekly_hour = Settings.ops.WEEKLY_REPORT_HOUR
+    if now.weekday() == weekly_day and now.hour == weekly_hour and now.minute < 2:
+        pass  # weekly report — needs calibrator, ai refs (handled in main loop)
+
+    bot_state.save()
+
+
+# ─── Main Loop ───────────────────────────────────────────────────────────────
+
+async def main():
+    logger.info("=" * 60)
+    logger.info("Binance Portfolio Bot — Playbook Edition")
+    logger.info("=" * 60)
+
+    if Settings.binance.USE_TESTNET:
+        logger.warning("⚠️  TESTNET MODE — No real funds at risk")
+    else:
+        logger.info("🔴 LIVE TRADING MODE")
+
+    # Initialize components
+    db = Database(Settings.ops.DB_PATH)
+    exchange = Exchange(
+        Settings.binance.API_KEY,
+        Settings.binance.API_SECRET,
+        Settings.binance.USE_TESTNET,
+    )
+    news = NewsIntelligence()
+    regime = RegimeDetector(exchange, db, Settings.strategy.HMM_LOOKBACK_DAYS)
+    risk = RiskManager(db, regime)
+    risk.set_news_intel(news)
+    portfolio = PortfolioManager(exchange, db, regime, risk, news)
+    ai = AIAdvisor(
+        Settings.ai.API_KEY,
+        Settings.ai.BASE_URL,
+        Settings.ai.FAST_MODEL,
+        Settings.ai.STRONG_MODEL,
+    )
+    sr_engine = SupportResistanceEngine()
+    scorer = ConfluenceScorer(regime, news, db, sr_engine)
+    signal_gen = SignalGenerator(scorer, regime, news, ai)
+    scanner = AssetScanner(exchange, regime, news)
+    notifier = TelegramNotifier(Settings.telegram.BOT_TOKEN, Settings.telegram.CHAT_ID)
+    calibrator = Calibrator(db, risk, regime, notifier)
+    watchdog = Watchdog(notifier)
+    bot_state = BotState()
+    bot_state.load()
+
+    # Wire command handlers
+    handlers = build_command_handlers(
+        portfolio, risk, calibrator, watchdog, regime, news, ai
+    )
+    notifier.register_commands(handlers)
+
+    # Initialization sequence
+    logger.info("Initializing regime detector...")
+    await regime.initialize()
+
+    logger.info("Updating news & sentiment...")
+    await news.update_all()
+    regime.update_sentiment(
+        fear_greed=news.fear_greed_value,
+        news_sentiment=news.get_sentiment_score(),
+        btc_dominance=news.btc_dominance / 100,
+        altcoin_season_index=news.altcoin_season_index,
+    )
+
+    logger.info("Syncing portfolio...")
+    await portfolio.sync_with_exchange()
+
+    logger.info("Loading risk history...")
+    risk.initialize_from_history()
+
+    logger.info("Seeding indicators...")
+    await initialize_indicators(bot_state, scanner, exchange)
+
+    bot_state.initialized = True
+    bot_state.last_regime_check = utc_now()
+    bot_state.last_news_update = utc_now()
+
+    # Startup notification
+    mode_e = regime.get_mode_emoji()
+    startup_msg = (
+        f"<b>🤖 Bot Online</b> {'🔴 LIVE' if not Settings.binance.USE_TESTNET else '🟡 TESTNET'}\n\n"
+        f"Portfolio: <code>${portfolio.portfolio_value:.2f}</code>\n"
+        f"Mode: {mode_e} <code>{regime.current_mode}</code>\n"
+        f"Regime: <code>{regime.current_regime}</code>\n"
+        f"F&G: <code>{news.fear_greed_value} ({news.fear_greed_label})</code>\n"
+        f"BTC Dom: <code>{news.btc_dominance:.1f}%</code>\n"
+        f"Kill Switch: <code>{'ON' if risk.kill_switch_active else 'OFF'}</code>\n\n"
+        f"<i>Send /help for all commands</i>"
+    )
+    await notifier.send_message(startup_msg)
+
+    # Start Telegram polling
+    poll_task = asyncio.create_task(notifier.start_polling())
+
+    logger.info("✅ Bot initialized. Starting main loop...")
+    logger.info("Mode: %s | Regime: %s | Portfolio: $%.2f",
+                regime.current_mode, regime.current_regime, portfolio.portfolio_value)
+
+    scan_interval = Settings.strategy.SCAN_INTERVAL_SECONDS
+
+    while bot_state.running:
+        try:
+            cycle_start = utc_now()
+            watchdog.heartbeat()
+
+            # Sync portfolio state
+            await portfolio.sync_with_exchange()
+
+            # Circuit breaker check
+            await enforce_circuit_breakers(portfolio, risk, notifier)
+
+            # Manage open positions
+            await manage_open_positions(
+                portfolio, risk, notifier, calibrator, bot_state, sr_engine
             )
-        elif self.risk.is_paused:
-            msg += "\n\n⏸ <i>Trading PAUSED by user — send /resume to continue</i>"
-        elif portfolio_val < 50:
-            msg += (
-                f"\n\n⚠️ <i>Portfolio ${portfolio_val:.2f} is very small. "
-                f"Add at least $50–$100 USDT to enable reliable trading "
-                f"(Binance minimum notional is ~$10/trade).</i>"
-            )
-        elif stats.get("signals", 0) == 0:
-            msg += "\n\n🔍 <i>Scanning... no signals above threshold yet</i>"
-        else:
-            msg += f"\n\n✅ <i>Active — next scan in {Settings.strategy.SCAN_INTERVAL_SECONDS}s</i>"
 
-        await self.notifier.send_message(msg)
+            # Scheduled tasks
+            await scheduled_tasks(portfolio, regime, news, risk, notifier, bot_state)
 
-    # ------------------------------------------------------------------
-    # Position Monitor Loop
-    # ------------------------------------------------------------------
+            # Don't scan for new signals if paused, kill switch active,
+            # or in capital preservation mode
+            if (not risk.kill_switch_active and not risk.is_paused
+                    and regime.get_regime_params().get("entries_allowed", True)):
 
-    async def _position_monitor_loop(self):
-        """Monitor open positions: trailing stops, partial TP, support break exit."""
-        logger.info("Position monitor loop started (15s interval)")
-        while not self._shutdown:
-            try:
-                await self._monitor_positions()
-            except Exception as e:
-                logger.error("Position monitor error: %s", e)
-            await asyncio.sleep(15)
-
-    async def _monitor_positions(self):
-        self.watchdog.beat()
-
-        for trade in list(self.portfolio.open_positions):
-            symbol = trade["symbol"]
-            try:
-                current_price = await self.exchange.get_price(symbol)
-                if current_price <= 0:
-                    continue
-
-                primary_tf = Settings.strategy.PRIMARY_TIMEFRAME
-                ind = self.indicator_cache.get(symbol, {}).get(primary_tf, IndicatorSet())
-                current_atr = ind.latest.get("atr", current_price * 0.03)
-
-                # --- 1. Update trailing stop ---
-                stop_update = self.risk.update_trailing_stop(trade, current_price, current_atr)
-                if stop_update["stop_loss"] != trade["stop_loss"]:
-                    self.db.update_trade(trade["id"], stop_update)
-                    trade.update(stop_update)
-
-                # --- 2. Check stop-loss hit ---
-                if current_price <= trade["stop_loss"]:
-                    result = await self.portfolio.execute_exit(
-                        trade, trade.get("remaining_quantity", trade["quantity"]),
-                        "STOP_LOSS", current_price,
-                    )
-                    if result:
-                        await self.notifier.notify_exit(result)
-                        self.calibrator.check_and_calibrate()
-                        self._save_state()
-                    continue
-
-                # --- 3. Check 50/50 partial take-profit ---
-                tranches = self.risk.check_take_profit_tranches(
-                    trade, current_price, current_atr,
+                signals = await scan_for_signals(
+                    scanner, bot_state, exchange, signal_gen, sr_engine
                 )
-                for tranche in tranches:
-                    result = await self.portfolio.execute_exit(
-                        trade, tranche["quantity"],
-                        f"TP_50PCT_{tranche['level']}", current_price,
-                    )
-                    if result:
-                        await self.notifier.notify_exit(result)
 
-                # --- 4. Support break exit ---
-                if Settings.risk.SUPPORT_BREAK_EXIT:
-                    sr_break = self.sr_engine.check_support_break(symbol, current_price)
-                    if sr_break and sr_break.get("broken"):
-                        logger.warning(
-                            "SUPPORT BREAK: %s broke below $%.4f (%.2f%%)",
-                            symbol, sr_break["support_level"], sr_break["break_pct"],
-                        )
-                        result = await self.portfolio.execute_exit(
-                            trade, trade.get("remaining_quantity", trade["quantity"]),
-                            "SUPPORT_BREAK", current_price,
-                        )
-                        if result:
-                            await self.notifier.notify_exit(result)
-                            await self.notifier.send_alert(
-                                f"<b>Support Break Exit</b>\n"
-                                f"{symbol} broke support at ${sr_break['support_level']:.4f}\n"
-                                f"Exited at ${current_price:.4f}"
-                            )
-                            self._save_state()
+                # Execute top signals (up to max open positions)
+                entries_this_cycle = 0
+                max_entries_per_cycle = 2  # don't chase more than 2/cycle
+
+                for signal in signals[:10]:  # process top 10
+                    if entries_this_cycle >= max_entries_per_cycle:
+                        break
+
+                    # Skip if already in this position
+                    already_open = any(
+                        t["symbol"] == signal["symbol"]
+                        for t in portfolio.open_positions
+                    )
+                    if already_open:
                         continue
 
-                # --- 5. Volume spike alert (informational) ---
-                vol = ind.latest.get("volume", 0)
-                vol_sma = ind.latest.get("volume_sma", 1)
-                spike = VolumeSpikeDetector.detect_spike(vol, vol_sma)
-                if spike["is_spike"] and spike["strength"] in ("STRONG", "EXTREME"):
-                    pnl_pct = ((current_price / trade["entry_price"]) - 1) * 100
-                    if pnl_pct < -1:
-                        await self.notifier.send_alert(
-                            f"<b>Volume Spike Warning</b>\n"
-                            f"{symbol}: {spike['ratio']:.1f}x volume ({spike['strength']})\n"
-                            f"P&L: {pnl_pct:+.2f}% — monitor closely"
-                        )
+                    result = await portfolio.execute_entry(signal)
+                    if result:
+                        entries_this_cycle += 1
+                        await notifier.notify_entry({**result, **signal})
 
-            except Exception as e:
-                logger.error("Monitor error for %s: %s", symbol, e)
+            # Timing
+            elapsed = (utc_now() - cycle_start).total_seconds()
+            sleep_time = max(5, scan_interval - elapsed)
+            logger.debug("Cycle %d done in %.1fs, sleeping %.1fs",
+                         bot_state.cycle_id, elapsed, sleep_time)
+            await asyncio.sleep(sleep_time)
 
-        # Breaking news alerts for held positions
-        alerts = self.news.check_breaking_news(
-            [t["symbol"] for t in self.portfolio.open_positions]
-        )
-        if alerts:
-            await self.notifier.notify_news_alert(alerts)
+        except KeyboardInterrupt:
+            bot_state.running = False
+            break
+        except Exception as e:
+            logger.error("Main loop error: %s", e, exc_info=True)
+            watchdog.record_error(str(e))
+            await asyncio.sleep(30)
 
-    # ------------------------------------------------------------------
-    # Scheduled Tasks Loop
-    # ------------------------------------------------------------------
-
-    async def _scheduled_tasks_loop(self):
-        """Periodic tasks: regime, news, scan, rebalance, weekly report."""
-        logger.info("Scheduled tasks loop started")
-        while not self._shutdown:
-            try:
-                now = utc_now()
-                current_ts = now.timestamp()
-
-                # News update every N minutes
-                news_interval = Settings.strategy.NEWS_CHECK_INTERVAL_MINUTES * 60
-                if current_ts - self._last_news_time >= news_interval:
-                    await self.news.update_all()
-                    self._last_news_time = current_ts
-                    logger.info("News updated: F&G=%d (%s), sentiment=%.2f",
-                                self.news.fear_greed_value,
-                                self.news.fear_greed_label,
-                                self.news.get_sentiment_score())
-
-                # Regime check every hour
-                if current_ts - self._last_regime_time >= 3600:
-                    old_regime = self.regime.current_regime
-                    await self.regime.detect_regime()
-                    self._last_regime_time = current_ts
-                    if self.regime.current_regime != old_regime:
-                        await self.notifier.notify_regime_change(
-                            old_regime, self.regime.current_regime,
-                        )
-
-                # Full market scan every SCAN_INTERVAL_HOURS
-                scan_interval = Settings.strategy.SCAN_INTERVAL_HOURS * 3600
-                if current_ts - self._last_scan_time >= scan_interval:
-                    await self.notifier.send_message(
-                        f"<b>MARKET RESCAN</b>\n"
-                        f"Refreshing watchlist (every {Settings.strategy.SCAN_INTERVAL_HOURS}h)..."
-                    )
-                    candidates = await self.scanner.scan_universe()
-                    new_watchlist = self.scanner.get_watchlist_symbols()
-                    # Add open position symbols
-                    for pos in self.portfolio.open_positions:
-                        if pos["symbol"] not in new_watchlist:
-                            new_watchlist.append(pos["symbol"])
-                    # Seed indicators for new symbols
-                    new_count = 0
-                    for sym in new_watchlist:
-                        if sym not in self.indicator_cache:
-                            await self._seed_indicators(sym)
-                            h = self.kline_history.get(sym, {}).get(
-                                Settings.strategy.PRIMARY_TIMEFRAME, [])
-                            if h:
-                                self.sr_engine.compute_levels(sym, h)
-                            new_count += 1
-                    self.watchlist = new_watchlist
-                    self._last_scan_time = current_ts
-                    # Restart kline stream with updated watchlist
-                    entry_tf = Settings.strategy.ENTRY_TIMEFRAME
-                    if self.watchlist:
-                        await self.exchange.start_kline_stream(
-                            self.watchlist, entry_tf, self._on_kline_update,
-                        )
-                    self._save_state()
-                    await self.notifier.send_message(
-                        f"<b>RESCAN COMPLETE</b>\n"
-                        f"Watchlist: <code>{len(self.watchlist)}</code> assets\n"
-                        f"New additions: <code>{new_count}</code>\n"
-                        f"Top: <code>{', '.join(self.watchlist[:5])}</code>"
-                    )
-                    logger.info("Market scan complete: %d symbols", len(self.watchlist))
-
-                # Refresh S/R levels every 2 hours
-                if now.hour % 2 == 0 and now.minute < 2:
-                    for symbol in self.watchlist:
-                        history = self.kline_history.get(symbol, {}).get(
-                            Settings.strategy.PRIMARY_TIMEFRAME, [])
-                        if history:
-                            self.sr_engine.compute_levels(symbol, history)
-
-                # Portfolio sync every 5 minutes
-                if now.minute % 5 == 0 and now.second < 60:
-                    await self.portfolio.sync_with_exchange()
-
-                # Rebalance check (weekly)
-                if now.weekday() == Settings.strategy.REBALANCE_DAY and now.hour == 0:
-                    if self._last_rebalance_day != now.day:
-                        actions = await self.portfolio.check_rebalancing()
-                        if actions:
-                            results = await self.portfolio.execute_rebalancing(actions)
-                            logger.info("Rebalanced: %d actions", len(results))
-                        self._last_rebalance_day = now.day
-
-                # Smart DCA during extreme fear
-                await self.portfolio.smart_dca()
-
-                # HMM retrain (weekly)
-                if now.weekday() == Settings.strategy.HMM_RETRAIN_DAY and now.hour == 3:
-                    if self.regime.should_retrain():
-                        await self.regime.train_hmm()
-
-                # AI portfolio analysis (every 2 hours)
-                if Settings.ai.ENABLED and now.hour % 2 == 0 and now.minute < 2:
-                    ai_analysis = await self.ai.analyze_portfolio(
-                        self.portfolio.get_status(),
-                        self.portfolio.open_positions,
-                        self.regime.current_regime,
-                        self.news.fear_greed_value,
-                        self.news.get_sentiment_score(),
-                        self.portfolio.sector_exposure,
-                    )
-                    if ai_analysis:
-                        logger.info("AI portfolio health: %s/10, risk: %s",
-                                    ai_analysis.get("health_score", "?"),
-                                    ai_analysis.get("risk_level", "?"))
-                        # Notify user of AI portfolio assessment
-                        await self.notifier.send_message(
-                            f"<b>AI PORTFOLIO REVIEW</b>\n"
-                            f"Health: <code>{ai_analysis.get('health_score', '?')}/10</code>\n"
-                            f"Risk: <code>{ai_analysis.get('risk_level', '?')}</code>\n"
-                            f"Cash: <code>{ai_analysis.get('cash_recommendation', '?')}</code>\n"
-                            f"Assessment: {ai_analysis.get('reasoning', 'N/A')[:300]}"
-                        )
-
-                # Daily report at 00:00 UTC
-                if now.hour == 0 and now.minute < 2:
-                    await self.notifier.send_daily_report(
-                        self.portfolio, self.regime, self.news, self.risk,
-                    )
-
-                # Weekly report
-                if (now.weekday() == Settings.ops.WEEKLY_REPORT_DAY
-                        and now.hour == Settings.ops.WEEKLY_REPORT_HOUR
-                        and now.minute < 2):
-                    if self._last_weekly_report_day != now.day:
-                        await self.notifier.send_weekly_report(
-                            self.portfolio, self.regime, self.news,
-                            self.risk, self.calibrator, self.ai,
-                        )
-                        self._last_weekly_report_day = now.day
-
-                # Drawdown check
-                dd = self.risk.check_drawdown(self.portfolio.portfolio_value)
-                if dd["action"] == "KILL_SWITCH":
-                    logger.critical("KILL SWITCH ACTIVATED — drawdown %.2f%%",
-                                    dd["drawdown_pct"] * 100)
-                    await self.portfolio.liquidate_all("KILL_SWITCH")
-                    await self.notifier.notify_drawdown_warning(dd)
-                elif dd["action"] == "EMERGENCY_LIQUIDATE_50":
-                    logger.warning("Emergency: liquidating 50%% — drawdown %.2f%%",
-                                   dd["drawdown_pct"] * 100)
-                    positions = list(self.portfolio.open_positions)
-                    positions.sort(key=lambda p: p.get("confluence_score", 0))
-                    for pos in positions[:len(positions) // 2]:
-                        price = await self.exchange.get_price(pos["symbol"])
-                        await self.portfolio.execute_exit(
-                            pos, pos.get("remaining_quantity", pos["quantity"]),
-                            "EMERGENCY_DRAWDOWN", price,
-                        )
-                    await self.notifier.notify_drawdown_warning(dd)
-                elif dd["action"] in ("DEFENSIVE", "WARNING"):
-                    await self.notifier.notify_drawdown_warning(dd)
-
-                self._save_state()
-
-            except Exception as e:
-                logger.error("Scheduled task error: %s", e)
-
-            await asyncio.sleep(60)
-
-    # ------------------------------------------------------------------
     # Shutdown
-    # ------------------------------------------------------------------
-
-    async def _shutdown_handler(self):
-        logger.info("Shutdown signal received...")
-        self._shutdown = True
-        self._save_state()
-        await self.notifier.send_message(
-            "<b>BOT SHUTTING DOWN</b>\n"
-            "State saved for restart recovery."
-        )
-        logger.info("Shutdown complete")
-
-
-def main():
-    bot = TradingBot()
-    try:
-        asyncio.run(bot.start())
-    except KeyboardInterrupt:
-        logger.info("Keyboard interrupt — shutting down")
-    except Exception as e:
-        logger.critical("Fatal error: %s", e, exc_info=True)
-        sys.exit(1)
+    logger.info("Shutting down...")
+    poll_task.cancel()
+    bot_state.save()
+    await notifier.send_message("🛑 <b>Bot Offline</b>")
 
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())

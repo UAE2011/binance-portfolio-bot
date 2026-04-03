@@ -1,14 +1,20 @@
+"""
+Asset Scanner — Filters Binance spot pairs for tradeable opportunities.
+Minimum 24h volume: $5M (playbook: institutional liquidity threshold).
+"""
 import asyncio
-import numpy as np
-from typing import Optional
-
 from config.settings import Settings
-from src.utils import setup_logging, utc_now
+from src.utils import setup_logging
 
 logger = setup_logging()
 
-STABLECOIN_BASES = {"USDC", "BUSD", "DAI", "TUSD", "FDUSD", "UST", "USDP", "USDD"}
-EXCLUDED_SYMBOLS = {"USDCUSDT", "BUSDUSDT", "TUSDUSDT", "FDUSDUSDT"}
+QUOTE_ASSET = "USDT"
+BLACKLIST = {
+    "BTCUSDT", "ETHUSDT",  # handled separately in core
+    "USDCUSDT", "BUSDUSDT", "TUSDUSDT", "FDUSDUSDT", "DAIUSDT",
+    "PAXUSDT", "EURUSDT", "GBPUSDT",
+}
+EXCLUDED_SUFFIXES = ["UP", "DOWN", "BULL", "BEAR", "3L", "3S"]
 
 
 class AssetScanner:
@@ -16,173 +22,96 @@ class AssetScanner:
         self.exchange = exchange
         self.regime = regime_detector
         self.news = news_intel
-        self.watchlist: list = []
-        self.last_scan: Optional[str] = None
+        self._watchlist_cache: list = []
+        self._cache_refresh_count: int = 0
 
-    async def scan_universe(self) -> list:
-        logger.info("Scanning asset universe...")
-        all_tickers = await self.exchange.get_all_tickers()
-        if not all_tickers:
-            logger.error("Failed to fetch tickers")
-            return self.watchlist
+    async def get_watchlist(self) -> list:
+        """Refresh every 10 cycles (~40 min) or on regime change."""
+        self._cache_refresh_count += 1
+        if self._watchlist_cache and self._cache_refresh_count % 10 != 0:
+            return self._watchlist_cache
 
-        usdt_pairs = []
-        for t in all_tickers:
-            symbol = t["symbol"]
-            if not symbol.endswith("USDT"):
-                continue
-            if symbol in EXCLUDED_SYMBOLS:
-                continue
-            base = symbol.replace("USDT", "")
-            if base in STABLECOIN_BASES:
-                continue
-            filters = self.exchange.symbol_filters.get(symbol, {})
-            if filters.get("status") != "TRADING":
-                continue
-            usdt_pairs.append({"symbol": symbol, "price": float(t["price"])})
+        try:
+            tickers = await self.exchange.get_24h_tickers()
+        except Exception as e:
+            logger.error("Ticker fetch failed: %s", e)
+            return self._watchlist_cache or []
+
+        min_volume = Settings.strategy.MIN_24H_VOLUME
 
         candidates = []
-        batch_size = 10
-        for i in range(0, len(usdt_pairs), batch_size):
-            batch = usdt_pairs[i:i + batch_size]
-            tasks = [self._evaluate_asset(asset) for asset in batch]
-            results = await asyncio.gather(*tasks, return_exceptions=True)
-            for r in results:
-                if isinstance(r, dict) and r.get("passes", False):
-                    candidates.append(r)
-            await asyncio.sleep(0.5)
+        for t in tickers:
+            symbol = t.get("symbol", "")
+            if not symbol.endswith(QUOTE_ASSET):
+                continue
+            if symbol in BLACKLIST:
+                continue
+            if Settings.is_stablecoin(symbol):
+                continue
+            if Settings.is_leveraged_token(symbol):
+                continue
+            if any(symbol.endswith(s) for s in EXCLUDED_SUFFIXES):
+                continue
 
-        candidates.sort(key=lambda x: x.get("rank_score", 0), reverse=True)
-        max_watchlist = Settings.strategy.MAX_WATCHLIST_SIZE
-        self.watchlist = candidates[:max_watchlist]
-        self.last_scan = utc_now().isoformat()
-
-        logger.info(
-            "Scan complete: %d/%d pairs passed filters, watchlist=%d",
-            len(candidates), len(usdt_pairs), len(self.watchlist),
-        )
-        return self.watchlist
-
-    async def _evaluate_asset(self, asset: dict) -> dict:
-        symbol = asset["symbol"]
-        try:
-            ticker = await self.exchange.get_ticker_24h(symbol)
-            if not ticker:
-                return {"passes": False}
-
-            quote_volume = float(ticker.get("quoteVolume", 0))
-            if quote_volume < Settings.strategy.MIN_24H_VOLUME:
-                return {"passes": False}
-
-            price_change = float(ticker.get("priceChangePercent", 0))
-            if price_change < -30:
-                return {"passes": False}
-
-            klines = await self.exchange.get_klines(symbol, "1d", 60)
-            if len(klines) < 30:
-                return {"passes": False}
-
-            closes = [k["close"] for k in klines]
-            volumes = [k["volume"] for k in klines]
-            current_price = closes[-1]
-
-            sma20 = np.mean(closes[-20:])
-            sma50 = np.mean(closes[-50:]) if len(closes) >= 50 else sma20
-
-            returns = np.diff(closes) / closes[:-1]
-            volatility = np.std(returns) * np.sqrt(365)
-            if volatility > 3.0:
-                return {"passes": False}
-
-            avg_volume = np.mean(volumes[-20:])
-            recent_volume = np.mean(volumes[-5:])
-            volume_trend = recent_volume / avg_volume if avg_volume > 0 else 0
-
-            rank_score = 0
-
-            if current_price > sma20:
-                rank_score += 20
-            if current_price > sma50:
-                rank_score += 15
-
-            if 0.5 < volatility < 1.5:
-                rank_score += 15
-            elif volatility <= 0.5:
-                rank_score += 10
-
-            if volume_trend > 1.5:
-                rank_score += 20
-            elif volume_trend > 1.2:
-                rank_score += 10
-
-            if quote_volume > 50_000_000:
-                rank_score += 15
-            elif quote_volume > 10_000_000:
-                rank_score += 10
-            elif quote_volume > 1_000_000:
-                rank_score += 5
-
-            if 0 < price_change < 10:
-                rank_score += 10
-            elif -5 < price_change <= 0:
-                rank_score += 5
-
-            asset_sentiment = self.news.get_asset_sentiment(symbol)
-            if asset_sentiment > 0.3:
-                rank_score += 10
-            elif asset_sentiment > 0:
-                rank_score += 5
-
-            dominance_strategy = self.news.get_dominance_strategy()
-            if dominance_strategy == "BTC_FOCUS" and symbol == "BTCUSDT":
-                rank_score += 10
-            elif dominance_strategy == "ALTCOIN_SEASON" and symbol != "BTCUSDT":
-                rank_score += 5
-
-            sector = Settings.get_sector_for_asset(symbol)
-
-            return {
-                "symbol": symbol,
-                "price": current_price,
-                "rank_score": rank_score,
-                "quote_volume_24h": quote_volume,
-                "price_change_24h": price_change,
-                "volatility": volatility,
-                "volume_trend": volume_trend,
-                "above_sma20": current_price > sma20,
-                "above_sma50": current_price > sma50,
-                "sector": sector,
-                "passes": True,
-            }
-
-        except Exception as e:
-            logger.debug("Evaluation failed for %s: %s", symbol, e)
-            return {"passes": False}
-
-    async def quick_rescan(self) -> list:
-        if not self.watchlist:
-            return await self.scan_universe()
-
-        updated = []
-        for asset in self.watchlist:
             try:
-                ticker = await self.exchange.get_ticker_24h(asset["symbol"])
-                if ticker:
-                    quote_vol = float(ticker.get("quoteVolume", 0))
-                    price_change = float(ticker.get("priceChangePercent", 0))
-                    if quote_vol >= Settings.strategy.MIN_24H_VOLUME and price_change > -30:
-                        asset["quote_volume_24h"] = quote_vol
-                        asset["price_change_24h"] = price_change
-                        asset["price"] = float(ticker.get("lastPrice", asset["price"]))
-                        updated.append(asset)
+                vol_usdt = float(t.get("quoteVolume", 0))
+                price = float(t.get("lastPrice", 0))
+                price_change_pct = float(t.get("priceChangePercent", 0))
+
+                if vol_usdt < min_volume:
+                    continue
+                if price <= 0:
+                    continue
+                # Avoid extreme dumpers (> 30% daily drop) — usually broken/hacked
+                if price_change_pct < -30:
+                    continue
+
+                candidates.append({
+                    "symbol": symbol,
+                    "price": price,
+                    "volume_usdt": vol_usdt,
+                    "price_change_pct": price_change_pct,
+                    "sector": Settings.get_sector_for_asset(symbol),
+                })
+            except (ValueError, TypeError):
+                continue
+
+        # Sort by volume desc (highest liquidity first)
+        candidates.sort(key=lambda x: x["volume_usdt"], reverse=True)
+
+        # Rotate list based on regime/rotation strategy
+        rotation = self.news.get_dominance_strategy() if self.news else "NEUTRAL"
+        if rotation == "ALTCOIN_SEASON":
+            # Prioritize alt sectors: DeFi, AI, Gaming
+            priority_sectors = {"DeFi", "AI", "Gaming", "Layer2"}
+            alts = [c for c in candidates if c["sector"] in priority_sectors]
+            others = [c for c in candidates if c["sector"] not in priority_sectors]
+            candidates = alts + others
+
+        max_size = Settings.strategy.MAX_WATCHLIST_SIZE
+        self._watchlist_cache = candidates[:max_size]
+
+        logger.info("Watchlist: %d pairs (top by volume, rotation=%s)",
+                    len(self._watchlist_cache), rotation)
+        return self._watchlist_cache
+
+    async def get_core_assets(self) -> list:
+        """Core portfolio assets — always monitored regardless of regime."""
+        core = []
+        for symbol in ["BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT"]:
+            try:
+                price = await self.exchange.get_price(symbol)
+                core.append({"symbol": symbol, "price": price, "sector": "Layer1"})
             except Exception:
                 pass
+        return core
 
-        self.watchlist = sorted(updated, key=lambda x: x.get("rank_score", 0), reverse=True)
-        return self.watchlist
-
-    def get_watchlist_symbols(self) -> list:
-        return [a["symbol"] for a in self.watchlist]
-
-    def get_top_candidates(self, n: int = 10) -> list:
-        return self.watchlist[:n]
+    async def filter_momentum(self, candidates: list) -> list:
+        """Quick momentum filter — keep assets with recent positive momentum."""
+        result = []
+        for c in candidates:
+            pct = c.get("price_change_pct", 0)
+            # Keep: gainers or small dips (potential bounce)
+            if pct >= -5 or pct < -5:  # Keep all for full indicator analysis
+                result.append(c)
+        return result
