@@ -640,7 +640,7 @@ async def main():
         f"Portfolio: <code>${portfolio.portfolio_value:.2f}</code>\n"
         f"Cash:      <code>${portfolio.cash_available:.2f}</code>\n"
         f"Positions: <code>{len(portfolio.open_positions)}</code> "
-        f"({'incl. ' + str(len(imported)) + ' imported' if imported else 'no imports'})\n\n"
+        f"(active={len(portfolio.open_positions)} sub-min={len(portfolio.sub_min_positions)})\n\n"
         f"Mode:     {mode_e} <code>{regime.current_mode}</code>\n"
         f"Regime:   <code>{regime.current_regime}</code>\n"
         f"Rotation: <code>{rotation_label}</code>\n"
