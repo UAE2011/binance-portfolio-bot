@@ -626,14 +626,24 @@ def build_command_handlers(portfolio, risk_manager, calibrator, watchdog,
 
     async def cmd_ai(args):
         s = ai.get_status()
+        stats = s.get('model_stats', {})
+        fast_stats = stats.get('fast', {})
+        strong_stats = stats.get('strong', {})
         return (
-            f"<b>AI ADVISOR</b>\n"
+            f"<b>AI ADVISOR</b>\n\n"
             f"Enabled: <code>{s.get('enabled')}</code>\n"
-            f"Fast Model: <code>{s.get('fast_model', 'N/A')}</code>\n"
-            f"Strong Model: <code>{s.get('model', 'N/A')}</code>\n"
-            f"Daily Calls: <code>{s.get('daily_calls')}/{s.get('max_daily_calls')}</code>\n"
-            f"Veto Power: <code>{s.get('veto_power')}</code>\n"
-            f"Last Analysis: {s.get('last_portfolio_analysis', 'None')[:100]}"
+            f"Veto Power: <code>{s.get('veto_power')}</code>\n\n"
+            f"<b>Models</b>\n"
+            f"Fast: <code>{s.get('fast_model', 'N/A')}</code>\n"
+            f"  Calls: <code>{fast_stats.get('calls', 0)}</code> | Errors: <code>{fast_stats.get('errors', 0)}</code>\n"
+            f"Strong: <code>{s.get('strong_model', 'N/A')}</code>\n"
+            f"  Calls: <code>{strong_stats.get('calls', 0)}</code> | Errors: <code>{strong_stats.get('errors', 0)}</code>\n\n"
+            f"<b>Usage</b>\n"
+            f"Daily Calls: <code>{s.get('daily_calls', 0)}/{s.get('max_daily_calls', 500)}</code>\n"
+            f"Cost: <code>${s.get('daily_cost_usd', 0):.4f}</code> (Groq = FREE)\n"
+            f"Recent Queue: <code>{s.get('recent_calls', 0)}</code>\n\n"
+            f"<b>Last Analysis</b>\n"
+            f"{s.get('last_portfolio_analysis', 'None')[:200]}"
         )
 
     async def cmd_risk(args):
