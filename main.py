@@ -449,12 +449,7 @@ async def main():
     risk = RiskManager(db, regime)
     risk.set_news_intel(news)
     portfolio = PortfolioManager(exchange, db, regime, risk, news)
-    ai = AIAdvisor(
-        Settings.ai.API_KEY,
-        Settings.ai.BASE_URL,
-        Settings.ai.FAST_MODEL,
-        Settings.ai.STRONG_MODEL,
-    )
+    ai = AIAdvisor()
     sr_engine = SupportResistanceEngine()
     scorer = ConfluenceScorer(regime, news, db, sr_engine)
     signal_gen = SignalGenerator(scorer, regime, news, ai)
