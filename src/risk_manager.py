@@ -104,6 +104,11 @@ class RiskManager:
         # Method 3: 10% wallet rule (hard cap)
         max_pos = portfolio_value * self.cfg.MAX_POSITION_SIZE
 
+        # Small account boost: if portfolio < $200, allow up to 30% per position
+        # to ensure position sizes clear the minimum notional ($10)
+        if portfolio_value < 200:
+            max_pos = min(portfolio_value * 0.30, portfolio_value * 0.95)
+
         # Take the minimum of all methods
         base_size = min(kelly_size, risk_based_size, max_pos)
 
@@ -118,8 +123,8 @@ class RiskManager:
         if self._news_intel and self._news_intel.is_extreme_fear():
             adjusted_size *= 1.25
 
-        # Floor and cap
-        adjusted_size = max(adjusted_size, 20.0)
+        # Floor: at least $5 (not $20 — was too high for small accounts)
+        adjusted_size = max(adjusted_size, 5.0)
         adjusted_size = min(adjusted_size, max_pos)
 
         return round(adjusted_size, 2)
@@ -267,7 +272,11 @@ class RiskManager:
 
     def check_drawdown(self, current_value: float) -> dict:
         peak = self.db.get_peak_portfolio_value()
-        if peak <= 0:
+        # Ignore phantom peaks from testnet resets or tiny accounts
+        if peak <= 0 or peak < 10.0:
+            return {"drawdown_pct": 0, "action": "NONE"}
+        # If current value is within $5 of peak, treat as noise — no action
+        if (peak - current_value) < 5.0:
             return {"drawdown_pct": 0, "action": "NONE"}
 
         drawdown = (peak - current_value) / peak
@@ -282,6 +291,12 @@ class RiskManager:
         elif drawdown > 0.05:
             return {"drawdown_pct": drawdown, "action": "WARNING"}
         return {"drawdown_pct": drawdown, "action": "NONE"}
+
+    def reset_kill_switch(self):
+        """Reset kill switch and position modifier. Called by /resume command."""
+        self.kill_switch_active = False
+        self.position_size_modifier = 1.0
+        logger.info("Kill switch reset. Trading resumed.")
 
     # ------------------------------------------------------------------
     # Daily Loss Limit — 3%
@@ -319,9 +334,10 @@ class RiskManager:
 
         min_cash = portfolio_value * self.cfg.MIN_CASH_RESERVE
         if cash_available <= min_cash:
-            # In aggressive mode, only block if truly out of cash
-            if cash_available < 15:
-                return {"allowed": False, "reason": "Insufficient cash (< $15)"}
+            # For small accounts (<$100), use absolute floor of $5 instead of percentage
+            abs_floor = 5.0 if portfolio_value < 100 else 15.0
+            if cash_available < abs_floor:
+                return {"allowed": False, "reason": f"Insufficient cash (< ${abs_floor:.0f})"}
 
         max_exposure = regime_params.get("max_exposure", 0.80)
         invested = portfolio_value - cash_available

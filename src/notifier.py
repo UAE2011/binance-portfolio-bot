@@ -668,7 +668,13 @@ def build_command_handlers(portfolio, risk_manager, calibrator, watchdog,
         risk_manager.is_paused = False
         risk_manager.kill_switch_active = False
         risk_manager.position_size_modifier = 1.0
-        return "Trading <b>RESUMED</b>. Kill switch reset."
+        return (
+            "✅ <b>Trading RESUMED</b>\n"
+            "Kill switch: <code>OFF</code>\n"
+            "Paused: <code>False</code>\n"
+            "Position modifier: <code>1.0x</code>\n\n"
+            "<i>Bot will begin scanning and trading on next cycle.</i>"
+        )
 
     async def cmd_sell(args):
         if not args:

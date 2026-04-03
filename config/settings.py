@@ -84,7 +84,7 @@ class RiskConfig:
 
 
 class StrategyConfig:
-    CONFLUENCE_SCORE_THRESHOLD: int = int(os.getenv("CONFLUENCE_SCORE_THRESHOLD", "70"))
+    CONFLUENCE_SCORE_THRESHOLD: int = int(os.getenv("CONFLUENCE_SCORE_THRESHOLD", "45"))
     SCAN_INTERVAL_SECONDS: int = int(os.getenv("SCAN_INTERVAL_SECONDS", "60"))
     SCAN_INTERVAL_HOURS: int = int(os.getenv("SCAN_INTERVAL_HOURS", "4"))
     # Multi-timeframe: 15m + 1hr (SOL bot) + 4h (portfolio bot)

@@ -306,6 +306,7 @@ class IndicatorSet:
         obv = self.obv.update(close, volume)
         stoch = self.stoch_rsi.update(close)
 
+        prev_macd_histogram = self.latest.get("macd_histogram", macd["histogram"])
         self.latest = {
             "close": close, "high": high, "low": low, "volume": volume,
             "ema9": ema9, "ema21": ema21,
@@ -313,6 +314,7 @@ class IndicatorSet:
             "rsi": rsi,
             "macd": macd["macd"], "macd_signal": macd["signal"],
             "macd_histogram": macd["histogram"],
+            "prev_macd_histogram": prev_macd_histogram,
             "bb_upper": bb["upper"], "bb_middle": bb["middle"], "bb_lower": bb["lower"],
             "atr": atr, "adx": adx,
             "volume_sma": vol_sma, "obv": obv,

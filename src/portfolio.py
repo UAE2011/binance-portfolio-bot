@@ -94,8 +94,17 @@ class PortfolioManager:
         )
         position_size = min(position_size, self.cash_available * 0.95)
 
-        if position_size < 11:
-            logger.info("Position size too small for %s: $%.2f (min $11)", symbol, position_size)
+        if position_size < 5:
+            logger.info("Position size too small for %s: $%.2f (min $5)", symbol, position_size)
+            return None
+
+        # Validate against Binance minimum notional for this specific symbol
+        min_notional = self.exchange.get_min_notional(symbol)
+        if position_size < min_notional:
+            logger.info(
+                "Position size $%.2f below min notional $%.2f for %s — skipping",
+                position_size, min_notional, symbol,
+            )
             return None
 
         result = await self.exchange.place_market_buy(symbol, position_size)
@@ -138,6 +147,28 @@ class PortfolioManager:
         self.open_positions.append(trade_data)
         self.sector_exposure[sector] = self.sector_exposure.get(sector, 0) + position_size
 
+        # Place OCO (One-Cancels-Other) order for exchange-level SL/TP
+        # This protects the position even if the bot goes offline
+        take_profit = signal.get("take_profit", filled_price * (1 + Settings.risk.TAKE_PROFIT_PCT))
+        try:
+            stop_limit = stop_loss * (1 - 0.002)  # 0.2% below stop to ensure fill
+            oco = await self.exchange.place_oco_sell(
+                symbol, filled_qty,
+                take_profit_price=take_profit,
+                stop_price=stop_loss,
+                stop_limit_price=stop_limit,
+            )
+            if oco and ("orderListId" in oco or "orders" in oco):
+                logger.info(
+                    "OCO placed for %s: TP=$%.4f, SL=$%.4f",
+                    symbol, take_profit, stop_loss,
+                )
+                trade_data["oco_order_id"] = oco.get("orderListId", 0)
+            else:
+                logger.warning("OCO placement failed for %s (non-critical, monitoring in software)", symbol)
+        except Exception as e:
+            logger.warning("OCO placement error for %s (non-critical): %s", symbol, e)
+
         logger.info(
             "ENTRY: %s @ $%.4f, qty=%.6f, size=$%.2f, SL=$%.4f, score=%d",
             symbol, filled_price, filled_qty, position_size, stop_loss,
@@ -157,6 +188,12 @@ class PortfolioManager:
         if not result or "orderId" not in result:
             logger.error("Failed to execute sell for %s", symbol)
             return None
+
+        # Cancel any open OCO or limit orders for this symbol to avoid double-selling
+        try:
+            await self.exchange.cancel_all_orders(symbol)
+        except Exception:
+            pass
 
         filled_qty = float(result.get("executedQty", 0))
         filled_price = float(result.get("cummulativeQuoteQty", 0)) / filled_qty if filled_qty > 0 else current_price

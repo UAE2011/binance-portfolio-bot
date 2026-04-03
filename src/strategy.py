@@ -264,7 +264,7 @@ class ConfluenceScorer:
         elif macd_line > macd_signal:
             macd_score = 7
             details["macd"] = "MACD above signal (early bullish)"
-        elif macd_hist > ind_primary.get("prev_macd_histogram", macd_hist - 1):
+        elif macd_hist > ind_primary.get("prev_macd_histogram", macd_hist - 0.0001):
             macd_score = 5
             details["macd"] = "MACD improving (turning bullish)"
         else:
@@ -405,8 +405,8 @@ class ConfluenceScorer:
                 details["acceleration"] = f"Price declining {recent_change:.2%} (base)"
 
         # --- StochRSI oversold bounce (4 pts) ---
-        stoch_k = ind_primary.get("stoch_rsi_k", 50)
-        stoch_d = ind_primary.get("stoch_rsi_d", 50)
+        stoch_k = ind_primary.get("stoch_k", 50)
+        stoch_d = ind_primary.get("stoch_d", 50)
         if stoch_k < 25:
             score += 4
             details["stochrsi"] = f"StochRSI K={stoch_k:.0f} (oversold — bounce setup)"
@@ -559,10 +559,19 @@ class SignalGenerator:
                     portfolio_context=portfolio_context or {},
                 )
                 signal["ai_analysis"] = ai_result
-                signal["ai_approval"] = {"approved": True, "reason": "Advisory mode — AI does not block"}
+                # Enforce veto power if configured
+                approval = self.ai.should_approve_entry(ai_result, result["total_score"])
+                signal["ai_approval"] = approval
+
+                if Settings.ai.VETO_POWER and not approval.get("approved", True):
+                    logger.info(
+                        "AI vetoed %s (confidence=%.0f%%): %s",
+                        symbol, ai_result.get("confidence", 0) * 100,
+                        approval.get("reason", "")[:80],
+                    )
+                    return None
 
                 # AI can suggest tighter SL/TP
-                approval = self.ai.should_approve_entry(ai_result, result["total_score"])
                 if approval.get("ai_sl"):
                     ai_sl = price * (1 - approval["ai_sl"])
                     signal["stop_loss"] = max(signal["stop_loss"], ai_sl)

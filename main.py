@@ -371,9 +371,25 @@ class TradingBot:
 
         if self.risk.kill_switch_active:
             logger.info("Cycle %d: Kill switch active — skipping", self._cycle_count)
+            prev = getattr(self, "_last_cycle_stats", {})
+            self._last_cycle_stats = {
+                **prev,
+                "cycle": self._cycle_count,
+                "regime": self.regime.current_regime,
+                "portfolio_value": self.portfolio.portfolio_value,
+                "positions": len(self.portfolio.open_positions),
+            }
             return
         if self.risk.is_paused:
             logger.info("Cycle %d: Trading paused — skipping", self._cycle_count)
+            prev = getattr(self, "_last_cycle_stats", {})
+            self._last_cycle_stats = {
+                **prev,
+                "cycle": self._cycle_count,
+                "regime": self.regime.current_regime,
+                "portfolio_value": self.portfolio.portfolio_value,
+                "positions": len(self.portfolio.open_positions),
+            }
             return
 
         regime_params = self.regime.get_regime_params()
@@ -473,7 +489,7 @@ class TradingBot:
                             continue
                         history = self.kline_history.get(symbol, {}).get(tf, [])
                         for k in klines:
-                            if not history or k["close"] != history[-1]["close"] or k["volume"] != history[-1]["volume"]:
+                            if not history or k.get("open_time", 0) != history[-1].get("open_time", -1):
                                 ind_set.update_candle(k)
                                 history.append(k)
                                 if len(history) > 200:
@@ -508,15 +524,15 @@ class TradingBot:
         if not stats:
             return
 
-        # Build position summary
+        # Build position summary with live P&L
         pos_lines = []
         for p in self.portfolio.open_positions[:5]:
             try:
                 price = await self.exchange.get_price(p["symbol"])
                 pnl_pct = ((price / p["entry_price"]) - 1) * 100
-                emoji = "+" if pnl_pct >= 0 else ""
+                arrow = "▲" if pnl_pct >= 0 else "▼"
                 pos_lines.append(
-                    f"  {p['symbol']}: {emoji}{pnl_pct:.2f}%"
+                    f"  {arrow} {p['symbol']}: {pnl_pct:+.2f}%"
                 )
             except Exception:
                 pos_lines.append(f"  {p['symbol']}: (price unavailable)")
@@ -533,14 +549,18 @@ class TradingBot:
         ai_status = self.ai.get_status()
         ai_calls = ai_status.get("daily_calls", 0)
 
+        portfolio_val = stats.get("portfolio_value", self.portfolio.portfolio_value)
+        cash = self.portfolio.cash_available
+
         msg = (
             f"<b>ACTIVITY UPDATE</b>\n"
             f"Cycle: <code>{stats['cycle']}</code>\n"
-            f"Scanned: <code>{stats['scanned']}</code> assets\n"
-            f"Signals Found: <code>{stats['signals']}</code>\n"
-            f"Trades Executed: <code>{stats['trades']}</code>\n"
+            f"Scanned: <code>{stats.get('scanned', '—')}</code> assets\n"
+            f"Signals Found: <code>{stats.get('signals', '—')}</code>\n"
+            f"Trades Executed: <code>{stats.get('trades', '—')}</code>\n"
             f"Regime: <code>{stats['regime']}</code>\n"
-            f"Portfolio: <code>${stats['portfolio_value']:.2f}</code>\n"
+            f"Portfolio: <code>${portfolio_val:.2f}</code> "
+            f"(Cash: <code>${cash:.2f}</code>)\n"
             f"AI Calls Today: <code>{ai_calls}</code>\n\n"
             f"<b>Open Positions ({len(self.portfolio.open_positions)}):</b>\n"
             f"<code>{pos_text}</code>"
@@ -549,15 +569,24 @@ class TradingBot:
         if top_text:
             msg += f"\n{top_text}"
 
-        # Add next action hint
+        # Status hint with actionable guidance
         if self.risk.kill_switch_active:
-            msg += "\n\n<i>Kill switch ACTIVE — no new trades</i>"
+            msg += (
+                "\n\n⛔ <b>Kill switch ACTIVE</b> — no new trades\n"
+                "<i>Send /resume to unlock trading</i>"
+            )
         elif self.risk.is_paused:
-            msg += "\n\n<i>Trading PAUSED by user</i>"
-        elif stats["signals"] == 0:
-            msg += "\n\n<i>Scanning... no signals above threshold yet</i>"
+            msg += "\n\n⏸ <i>Trading PAUSED by user — send /resume to continue</i>"
+        elif portfolio_val < 50:
+            msg += (
+                f"\n\n⚠️ <i>Portfolio ${portfolio_val:.2f} is very small. "
+                f"Add at least $50–$100 USDT to enable reliable trading "
+                f"(Binance minimum notional is ~$10/trade).</i>"
+            )
+        elif stats.get("signals", 0) == 0:
+            msg += "\n\n🔍 <i>Scanning... no signals above threshold yet</i>"
         else:
-            msg += f"\n\n<i>Next scan in {Settings.strategy.SCAN_INTERVAL_SECONDS}s</i>"
+            msg += f"\n\n✅ <i>Active — next scan in {Settings.strategy.SCAN_INTERVAL_SECONDS}s</i>"
 
         await self.notifier.send_message(msg)
 
