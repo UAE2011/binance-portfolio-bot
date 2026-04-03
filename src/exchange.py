@@ -452,3 +452,6 @@ class BinanceExchange:
         total_quote = sum(float(t.get("quoteQty", 0)) for t in buy_trades)
         return total_quote / total_qty if total_qty > 0 else 0.0
 
+
+# Alias so imports work as: from src.exchange import Exchange
+Exchange = BinanceExchange
