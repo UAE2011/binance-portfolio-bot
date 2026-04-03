@@ -28,29 +28,33 @@ class TelegramConfig:
 
 
 class AIConfig:
-    """Dual-model AI routing: fast model for quick checks, strong model for critical decisions.
+    """Dual-model AI routing via Groq (FREE, no credit card required).
 
-    Research-backed selection (April 2026):
-    - gemini-2.5-flash: 97.1% general quality, 1.1s median, $0.003/run — best speed/cost
-    - gpt-4.1-mini: strong structured JSON, good reasoning, $0.40/$1.60 per 1M tokens
+    Groq free tier (April 2026):
+    - llama-3.3-70b-versatile: 30 RPM, 14,400 RPD, 6000 tokens/min — strong reasoning
+    - llama-3.1-8b-instant: 30 RPM, 14,400 RPD, 6000 tokens/min — ultra-fast
 
     Routing logic:
     - FAST model (90% of calls): news sentiment, quick confirmations, data extraction
     - STRONG model (10% of calls): trade entry/exit decisions, portfolio rebalancing, regime analysis
+
+    Both models are 100% FREE via Groq's OpenAI-compatible API.
     """
     ENABLED: bool = os.getenv("AI_TRADING_ENABLED", "true").lower() == "true"
-    # Dual-model routing
-    FAST_MODEL: str = os.getenv("AI_FAST_MODEL", "gemini-2.5-flash")
-    STRONG_MODEL: str = os.getenv("AI_STRONG_MODEL", "gpt-4.1-mini")
+    # Groq API configuration
+    API_KEY: str = os.getenv("GROQ_API_KEY", "")
+    BASE_URL: str = os.getenv("AI_BASE_URL", "https://api.groq.com/openai/v1")
+    # Dual-model routing (Groq free models)
+    FAST_MODEL: str = os.getenv("AI_FAST_MODEL", "llama-3.1-8b-instant")
+    STRONG_MODEL: str = os.getenv("AI_STRONG_MODEL", "llama-3.3-70b-versatile")
     # Legacy single-model fallback
-    MODEL: str = os.getenv("AI_MODEL", "gemini-2.5-flash")
-    # OPENAI_API_KEY is pre-configured in environment; base_url auto-configured
+    MODEL: str = os.getenv("AI_MODEL", "llama-3.3-70b-versatile")
     MIN_CONFIDENCE: float = float(os.getenv("AI_MIN_CONFIDENCE", "0.65"))
     ANALYSIS_TIMEOUT: int = int(os.getenv("AI_ANALYSIS_TIMEOUT", "30"))
     MAX_DAILY_CALLS: int = int(os.getenv("AI_MAX_DAILY_CALLS", "500"))
     VETO_POWER: bool = os.getenv("AI_VETO_POWER", "true").lower() == "true"
-    # Cost tracking
-    DAILY_COST_LIMIT_USD: float = float(os.getenv("AI_DAILY_COST_LIMIT", "5.00"))
+    # Cost tracking (Groq is free, but keep for future paid providers)
+    DAILY_COST_LIMIT_USD: float = float(os.getenv("AI_DAILY_COST_LIMIT", "0.00"))
 
 
 class RiskConfig:

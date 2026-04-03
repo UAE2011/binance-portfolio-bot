@@ -1,9 +1,11 @@
 """
-AI Trade Advisor — Dual-Model Routing Strategy
+AI Trade Advisor — Dual-Model Routing Strategy via Groq (FREE)
 
-Research-backed model selection (April 2026):
-  FAST model (gemini-2.5-flash): 97.1% general quality, 1.1s median, $0.003/run
-  STRONG model (gpt-4.1-mini): strong structured JSON, good reasoning, $0.40/$1.60 per 1M tokens
+Groq free tier (April 2026):
+  FAST model (llama-3.1-8b-instant): ultra-fast inference, ~0.1s latency, FREE
+  STRONG model (llama-3.3-70b-versatile): excellent reasoning, ~0.3s latency, FREE
+
+Groq limits: 30 RPM, 14,400 RPD per model — more than enough for 24/7 bot.
 
 Routing logic:
   - FAST model (90% of calls): news sentiment scoring, quick confirmations, data extraction,
@@ -110,7 +112,10 @@ class ModelTier:
 class AIAdvisor:
     def __init__(self):
         self.cfg = Settings.ai
-        self.client = OpenAI()  # Uses pre-configured OPENAI_API_KEY and base_url
+        self.client = OpenAI(
+            api_key=self.cfg.API_KEY,
+            base_url=self.cfg.BASE_URL,
+        )
         self.daily_call_count: int = 0
         self.daily_cost_usd: float = 0.0
         self.last_reset_date: str = ""
