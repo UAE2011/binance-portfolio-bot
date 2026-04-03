@@ -384,3 +384,71 @@ class BinanceExchange:
     def is_ws_connected(self, name: str) -> bool:
         ws = self.ws_connections.get(name)
         return ws is not None and not ws.closed
+
+    async def get_24h_tickers(self) -> list:
+        """Return all 24h ticker data as a list (used by scanner)."""
+        data = await self._request("GET", "/api/v3/ticker/24hr")
+        return data if isinstance(data, list) else []
+
+    async def get_spot_positions(self, min_value_usdt: float = 10.0) -> list:
+        """
+        Return all non-stablecoin spot balances worth > min_value_usdt.
+        Used on startup to detect existing positions not yet tracked by the bot.
+        """
+        from config.settings import Settings
+        balances = await self.get_balances()
+        positions = []
+        stablecoins = {"USDT", "BUSD", "USDC", "TUSD", "DAI", "FDUSD", "PAXG"}
+
+        for asset, data in balances.items():
+            if asset in stablecoins:
+                continue
+            total_qty = data.get("total", 0)
+            if total_qty <= 0:
+                continue
+            symbol = f"{asset}USDT"
+            # Skip if no USDT pair exists
+            if symbol not in self.symbol_filters and self.symbol_filters:
+                continue
+            try:
+                current_price = await self.get_price(symbol)
+                if current_price <= 0:
+                    continue
+                usdt_value = total_qty * current_price
+                if usdt_value < min_value_usdt:
+                    continue
+                positions.append({
+                    "asset": asset,
+                    "symbol": symbol,
+                    "quantity": total_qty,
+                    "free": data.get("free", 0),
+                    "locked": data.get("locked", 0),
+                    "current_price": current_price,
+                    "usdt_value": usdt_value,
+                })
+            except Exception:
+                continue
+        return positions
+
+    async def get_my_trades(self, symbol: str, limit: int = 50) -> list:
+        """
+        Get recent fills for a symbol — used to estimate average entry price
+        for positions that existed before the bot started.
+        """
+        params = {"symbol": symbol, "limit": limit}
+        data = await self._request("GET", "/api/v3/myTrades", params, signed=True)
+        return data if isinstance(data, list) else []
+
+    async def get_avg_entry_price(self, symbol: str) -> float:
+        """
+        Calculate volume-weighted average entry price from recent BUY trades.
+        Returns 0 if no trade history found.
+        """
+        trades = await self.get_my_trades(symbol, limit=100)
+        buy_trades = [t for t in trades if t.get("isBuyer", False)]
+        if not buy_trades:
+            return 0.0
+        total_qty = sum(float(t.get("qty", 0)) for t in buy_trades)
+        total_quote = sum(float(t.get("quoteQty", 0)) for t in buy_trades)
+        return total_quote / total_qty if total_qty > 0 else 0.0
+
